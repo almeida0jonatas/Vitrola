@@ -1,0 +1,6 @@
+{
+  "name": "Vitrola",
+  "description": "Player de música local idêntico ao Vitrola com suporte a tags ID3, letras sincronizadas, capas, artistas, álbuns e persistência local via IndexedDB.",
+  "requestFramePermissions": ["screen-wake-lock"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
