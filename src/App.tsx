@@ -702,9 +702,134 @@ export default function App() {
     trackIndices: number[];
   } | null>(null);
 
+  // PWA Installation State (Android / Chrome beforeinstallprompt + iOS / Mobile Guide)
+  const [deferredInstallPrompt, setDeferredInstallPrompt] = useState<{
+    prompt: () => Promise<void>;
+    userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>;
+  } | null>(null);
+  const [isAppInstalled, setIsAppInstalled] = useState<boolean>(false);
+  const [isIOSDevice, setIsIOSDevice] = useState<boolean>(false);
+  const [isInIframe, setIsInIframe] = useState<boolean>(false);
+  const [isInstallGuideOpen, setIsInstallGuideOpen] = useState<boolean>(false);
+
+  useEffect(() => {
+    const checkStandalone = () => {
+      const standalone =
+        window.matchMedia('(display-mode: standalone)').matches ||
+        (window.navigator as unknown as { standalone?: boolean }).standalone === true;
+      setIsAppInstalled(standalone);
+    };
+    checkStandalone();
+
+    const ua = window.navigator.userAgent.toLowerCase();
+    setIsIOSDevice(/iphone|ipad|ipod/.test(ua));
+    try {
+      setIsInIframe(window.self !== window.top);
+    } catch {
+      setIsInIframe(true);
+    }
+
+    const onBeforeInstallPrompt = (e: Event) => {
+      e.preventDefault();
+      setDeferredInstallPrompt(
+        e as unknown as {
+          prompt: () => Promise<void>;
+          userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>;
+        }
+      );
+    };
+
+    const onAppInstalled = () => {
+      setIsAppInstalled(true);
+      setDeferredInstallPrompt(null);
+      setIsInstallGuideOpen(false);
+    };
+
+    window.addEventListener('beforeinstallprompt', onBeforeInstallPrompt);
+    window.addEventListener('appinstalled', onAppInstalled);
+
+    return () => {
+      window.removeEventListener('beforeinstallprompt', onBeforeInstallPrompt);
+      window.removeEventListener('appinstalled', onAppInstalled);
+    };
+  }, []);
+
+  const handleInstallApp = useCallback(async () => {
+    if (deferredInstallPrompt) {
+      try {
+        await deferredInstallPrompt.prompt();
+        const { outcome } = await deferredInstallPrompt.userChoice;
+        if (outcome === 'accepted') {
+          setIsAppInstalled(true);
+          setDeferredInstallPrompt(null);
+          showToast('Vitrola instalado com sucesso!');
+        }
+        return;
+      } catch {
+        // Fallback to manual guide modal
+      }
+    }
+    setIsInstallGuideOpen(true);
+  }, [deferredInstallPrompt, showToast]);
+
   // Audio current track derived from YouTube Music queue
   const currentIndex = queueIndex >= 0 && queueIndex < queue.length ? queue[queueIndex].trackIdx : -1;
   const currentTrack = currentIndex >= 0 && currentIndex < tracks.length ? tracks[currentIndex] : null;
+
+  // Track title overflow measurement for sliding animation
+  const [titleOverflow, setTitleOverflow] = useState<{ isOverflowing: boolean; dist: number; dur: number }>({
+    isOverflowing: false,
+    dist: 0,
+    dur: 8,
+  });
+  const titleWrapRef = useRef<HTMLDivElement | null>(null);
+  const titleSpanRef = useRef<HTMLSpanElement | null>(null);
+
+  useEffect(() => {
+    const checkOverflow = () => {
+      const wrap = titleWrapRef.current;
+      const span = titleSpanRef.current;
+      if (!wrap || !span) return;
+
+      const containerWidth = wrap.clientWidth;
+      const textWidth = span.offsetWidth || span.scrollWidth || Math.ceil(span.getBoundingClientRect().width);
+      const diff = textWidth - containerWidth;
+
+      if (diff > 4) {
+        const dur = Math.max(7, Math.round(diff / 22) + 5);
+        setTitleOverflow({
+          isOverflowing: true,
+          dist: diff + 8,
+          dur,
+        });
+      } else {
+        setTitleOverflow({
+          isOverflowing: false,
+          dist: 0,
+          dur: 8,
+        });
+      }
+    };
+
+    checkOverflow();
+    const timer = setTimeout(checkOverflow, 50);
+
+    let ro: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== 'undefined' && titleWrapRef.current) {
+      ro = new ResizeObserver(() => {
+        checkOverflow();
+      });
+      ro.observe(titleWrapRef.current);
+    }
+
+    window.addEventListener('resize', checkOverflow);
+
+    return () => {
+      clearTimeout(timer);
+      if (ro) ro.disconnect();
+      window.removeEventListener('resize', checkOverflow);
+    };
+  }, [currentTrack?.name, currentTrack?.key]);
 
   // Derived upcoming and previous items
   const upcomingItems = useMemo(() => {
@@ -1018,22 +1143,113 @@ export default function App() {
   );
 
   // Play previous track (YouTube Music style)
-  const prevTrack = useCallback(() => {
-    const a = audioRef.current;
-    if (a && a.currentTime > 3) {
-      a.currentTime = 0;
-    } else if (queueIndex > 0) {
-      const prevIdx = queueIndex - 1;
-      setQueueIndex(prevIdx);
-      loadAudio(queue[prevIdx].trackIdx, true);
-    } else if (repeat === 1 && queue.length > 0) {
-      const lastIdx = queue.length - 1;
-      setQueueIndex(lastIdx);
-      loadAudio(queue[lastIdx].trackIdx, true);
-    } else if (a) {
-      a.currentTime = 0;
+  const prevTrack = useCallback(
+    (forcePrev = false) => {
+      const a = audioRef.current;
+      if (!forcePrev && a && a.currentTime > 3) {
+        a.currentTime = 0;
+      } else if (queueIndex > 0) {
+        const prevIdx = queueIndex - 1;
+        setQueueIndex(prevIdx);
+        loadAudio(queue[prevIdx].trackIdx, true);
+      } else if ((repeat === 1 || forcePrev) && queue.length > 0) {
+        const lastIdx = queue.length - 1;
+        setQueueIndex(lastIdx);
+        loadAudio(queue[lastIdx].trackIdx, true);
+      } else if (a) {
+        a.currentTime = 0;
+      }
+    },
+    [queueIndex, queue, repeat, loadAudio]
+  );
+
+  // Album cover horizontal swipe state (Left -> Next, Right -> Previous)
+  const [coverDragX, setCoverDragX] = useState<number>(0);
+  const [coverDragging, setCoverDragging] = useState<boolean>(false);
+  const [coverSlideDir, setCoverSlideDir] = useState<'next' | 'prev' | null>(null);
+  const coverSwipeRef = useRef<{
+    startX: number;
+    startY: number;
+    lastX: number;
+    active: boolean;
+    lockedH: boolean | null;
+    swiped: boolean;
+  }>({
+    startX: 0,
+    startY: 0,
+    lastX: 0,
+    active: false,
+    lockedH: null,
+    swiped: false,
+  });
+
+  const handleCoverSwipeStart = useCallback((clientX: number, clientY: number) => {
+    coverSwipeRef.current = {
+      startX: clientX,
+      startY: clientY,
+      lastX: clientX,
+      active: true,
+      lockedH: null,
+      swiped: false,
+    };
+    setCoverDragging(true);
+    setCoverDragX(0);
+  }, []);
+
+  const handleCoverSwipeMove = useCallback((clientX: number, clientY: number) => {
+    const st = coverSwipeRef.current;
+    if (!st.active) return;
+    st.lastX = clientX;
+    const dx = clientX - st.startX;
+    const dy = clientY - st.startY;
+
+    if (st.lockedH === null) {
+      if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
+      st.lockedH = Math.abs(dx) > Math.abs(dy);
     }
-  }, [queueIndex, queue, repeat, loadAudio]);
+
+    if (!st.lockedH) {
+      st.active = false;
+      setCoverDragging(false);
+      setCoverDragX(0);
+      return;
+    }
+
+    if (Math.abs(dx) > 10) {
+      st.swiped = true;
+    }
+
+    setCoverDragX(dx * 0.72);
+  }, []);
+
+  const handleCoverSwipeEnd = useCallback(
+    (clientX?: number) => {
+      const st = coverSwipeRef.current;
+      if (!st.active) return;
+      st.active = false;
+      setCoverDragging(false);
+
+      const endX = typeof clientX === 'number' ? clientX : st.lastX;
+      const dx = endX - st.startX;
+      const SWIPE_THRESHOLD = 45;
+
+      if (st.lockedH && Math.abs(dx) >= SWIPE_THRESHOLD && tracks.length > 0) {
+        st.swiped = true;
+        if (dx < 0) {
+          // Swiped left -> Next track
+          setCoverSlideDir('next');
+          nextTrack(false);
+        } else {
+          // Swiped right -> Previous track
+          setCoverSlideDir('prev');
+          prevTrack(true);
+        }
+      }
+
+      setCoverDragX(0);
+    },
+    [tracks.length, nextTrack, prevTrack]
+  );
 
   // Load track helper
   const loadTrack = (n: number, autoPlay: boolean) => {
@@ -1698,17 +1914,34 @@ export default function App() {
   // Apply theme preference
   useEffect(() => {
     const root = document.documentElement;
-    if (themePref === 'dark') {
-      root.setAttribute('data-theme', 'dark');
-    } else if (themePref === 'light') {
-      root.setAttribute('data-theme', 'light');
-    } else {
-      root.removeAttribute('data-theme');
-    }
+    const mql = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+
+    const applyTheme = () => {
+      const effective =
+        themePref === 'dark'
+          ? 'dark'
+          : themePref === 'light'
+          ? 'light'
+          : mql && mql.matches
+          ? 'dark'
+          : 'light';
+      root.setAttribute('data-theme', effective);
+      root.style.colorScheme = effective;
+    };
+
+    applyTheme();
+
     try {
       localStorage.setItem('vitrola_theme', themePref);
     } catch {
       // ignore
+    }
+
+    if (themePref === 'auto' && mql) {
+      if (mql.addEventListener) {
+        mql.addEventListener('change', applyTheme);
+        return () => mql.removeEventListener('change', applyTheme);
+      }
     }
   }, [themePref]);
 
@@ -2453,7 +2686,7 @@ export default function App() {
         <div id="bg" style={{ backgroundImage: currentCoverUrl ? `url('${currentCoverUrl}')` : 'none' }}></div>
       </div>
 
-      <main>
+      <main className={isPlaying ? 'plg' : ''}>
         {/* Header */}
         <header className="hd">
           <h1
@@ -2552,37 +2785,109 @@ export default function App() {
         </header>
 
         {/* Now Playing Main Center View */}
-        <div className="now">
-          {currentCoverUrl ? (
-            <img
-              id="cover"
-              src={currentCoverUrl}
-              alt="Capa do álbum"
-              style={{ display: 'block' }}
-              onClick={() => setIsLyricsOpen(true)}
-            />
-          ) : (
-            <div id="ph" onClick={() => setIsLyricsOpen(true)}>
-              <svg className="s" viewBox="0 0 24 24">
-                <path d="M9 18V5l12-2v13" />
-                <circle cx="6" cy="18" r="3" />
-                <circle cx="18" cy="16" r="3" />
-              </svg>
-            </div>
-          )}
-
+        <div className={`now ${isPlaying ? 'playing' : 'paused'}`}>
           <div
+            className={`cover-stage ${coverDragging ? 'dragging' : ''}`}
             style={{
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              gap: 6,
-              marginTop: 14,
-              padding: '0 8px',
+              transform: coverDragX
+                ? `translate3d(${coverDragX}px, 0, 0) rotate(${coverDragX * 0.035}deg)`
+                : undefined,
+              opacity: coverDragX ? Math.max(0.55, 1 - Math.abs(coverDragX) / 280) : undefined,
+            }}
+            onTouchStart={(e) => {
+              if (e.touches.length === 1) {
+                handleCoverSwipeStart(e.touches[0].clientX, e.touches[0].clientY);
+              }
+            }}
+            onTouchMove={(e) => {
+              if (e.touches.length === 1) {
+                handleCoverSwipeMove(e.touches[0].clientX, e.touches[0].clientY);
+              }
+            }}
+            onTouchEnd={(e) => {
+              const t = e.changedTouches[0];
+              handleCoverSwipeEnd(t ? t.clientX : undefined);
+            }}
+            onTouchCancel={() => handleCoverSwipeEnd()}
+            onMouseDown={(e) => {
+              if (e.button === 0) {
+                handleCoverSwipeStart(e.clientX, e.clientY);
+              }
+            }}
+            onMouseMove={(e) => {
+              if (coverSwipeRef.current.active) {
+                handleCoverSwipeMove(e.clientX, e.clientY);
+              }
+            }}
+            onMouseUp={(e) => handleCoverSwipeEnd(e.clientX)}
+            onMouseLeave={() => {
+              if (coverSwipeRef.current.active) {
+                handleCoverSwipeEnd();
+              }
             }}
           >
-            <div id="title" style={{ marginTop: 0 }}>
-              {currentTrack ? currentTrack.name : 'Nenhuma faixa'}
+            {currentCoverUrl ? (
+              <img
+                id="cover"
+                key={currentTrack ? currentTrack.key : 'none'}
+                className={`cover-art ${isPlaying ? 'playing' : 'paused'} ${
+                  coverSlideDir === 'next' ? 'slide-next' : coverSlideDir === 'prev' ? 'slide-prev' : ''
+                }`}
+                src={currentCoverUrl}
+                alt="Capa do álbum"
+                draggable={false}
+                style={{ display: 'block' }}
+                onClick={() => {
+                  if (coverSwipeRef.current.swiped) {
+                    coverSwipeRef.current.swiped = false;
+                    return;
+                  }
+                  setIsLyricsOpen(true);
+                }}
+              />
+            ) : (
+              <div
+                id="ph"
+                key={currentTrack ? currentTrack.key : 'empty'}
+                className={`cover-ph ${isPlaying ? 'playing' : 'paused'} ${
+                  coverSlideDir === 'next' ? 'slide-next' : coverSlideDir === 'prev' ? 'slide-prev' : ''
+                }`}
+                onClick={() => {
+                  if (coverSwipeRef.current.swiped) {
+                    coverSwipeRef.current.swiped = false;
+                    return;
+                  }
+                  setIsLyricsOpen(true);
+                }}
+              >
+                <svg className="s" viewBox="0 0 24 24">
+                  <path d="M9 18V5l12-2v13" />
+                  <circle cx="6" cy="18" r="3" />
+                  <circle cx="18" cy="16" r="3" />
+                </svg>
+              </div>
+            )}
+          </div>
+
+          <div className="title-row">
+            <div
+              className={`title-wrap ${titleOverflow.isOverflowing ? 'is-overflowing' : ''}`}
+              ref={titleWrapRef}
+            >
+              <div
+                id="title"
+                key={currentTrack ? currentTrack.key : 'none'}
+                className={titleOverflow.isOverflowing ? 'sliding' : ''}
+                style={{
+                  marginTop: 0,
+                  '--slide-dist': `-${titleOverflow.dist}px`,
+                  '--slide-dur': `${titleOverflow.dur}s`,
+                } as React.CSSProperties}
+              >
+                <span ref={titleSpanRef} className="title-inner">
+                  {currentTrack ? currentTrack.name : 'Nenhuma faixa'}
+                </span>
+              </div>
             </div>
             {currentTrack && (
               <button
@@ -2593,6 +2898,7 @@ export default function App() {
                 onClick={(e) => toggleFavorite(currentTrack.key, e)}
               >
                 <svg
+                  key={favoriteKeys.includes(currentTrack.key) ? 'fav' : 'unfav'}
                   className="s"
                   viewBox="0 0 24 24"
                   fill={favoriteKeys.includes(currentTrack.key) ? 'currentColor' : 'none'}
@@ -2661,7 +2967,7 @@ export default function App() {
               </svg>
             </button>
 
-            <button id="prev" className="ib" aria-label="Anterior" onClick={prevTrack}>
+            <button id="prev" className="ib" aria-label="Anterior" onClick={() => prevTrack(false)}>
               <svg viewBox="0 0 24 24" fill="currentColor">
                 <path d="M5.5 5h2v14h-2z" />
                 <path d="M20 5.6v12.8a1 1 0 0 1-1.6.8L10 13.2a1.3 1.3 0 0 1 0-2.4l8.4-6a1 1 0 0 1 1.6.8z" />
@@ -3076,7 +3382,22 @@ export default function App() {
                 'Biblioteca'
               )}
             </span>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 2, marginLeft: 'auto' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginLeft: 'auto' }}>
+              {!isAppInstalled && (
+                <button
+                  type="button"
+                  className="install-hd-btn"
+                  title="Instalar aplicativo no celular"
+                  aria-label="Instalar aplicativo no celular"
+                  onClick={handleInstallApp}
+                >
+                  <svg className="s" viewBox="0 0 24 24">
+                    <path d="M12 3v12m0 0-4-4m4 4 4-4" />
+                    <path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" />
+                  </svg>
+                  <span>Instalar</span>
+                </button>
+              )}
               <button
                 type="button"
                 className="ib"
@@ -3094,27 +3415,12 @@ export default function App() {
                 title="Configurações"
                 aria-label="Configurações"
                 onClick={() => {
-                  setIsLibraryOpen(false);
                   setIsSettingsOpen(true);
                 }}
               >
                 <svg className="s" viewBox="0 0 24 24">
                   <circle cx="12" cy="12" r="3" />
                   <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06-.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
-                </svg>
-              </button>
-              <button
-                className="ib"
-                id="closeList"
-                title="Abrir reprodutor em tela cheia"
-                aria-label="Fechar"
-                onClick={() => {
-                  setIsLibraryOpen(false);
-                  if (pageStack.length) setPageStack([]);
-                }}
-              >
-                <svg className="s" viewBox="0 0 24 24">
-                  <path d="M6 6l12 12M18 6 6 18" />
                 </svg>
               </button>
             </div>
@@ -3210,6 +3516,20 @@ export default function App() {
                         </svg>
                         <span>Faixas de demonstração</span>
                       </button>
+                      {!isAppInstalled && (
+                        <button
+                          type="button"
+                          className="home-act-btn"
+                          style={{ width: 'auto' }}
+                          onClick={handleInstallApp}
+                        >
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            <path d="M12 3v12m0 0-4-4m4 4 4-4" />
+                            <path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" />
+                          </svg>
+                          <span>Instalar no celular</span>
+                        </button>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -3316,19 +3636,20 @@ export default function App() {
                                         <small>{[t.artist, t.album].filter(Boolean).join(' · ')}</small>
                                       </span>
                                       <div className="row-actions">
-                                        <button
-                                          type="button"
-                                          className={`qb ${isFav ? 'fav-on' : ''}`}
-                                          aria-label="Favoritar"
-                                          onClick={(e) => toggleFavorite(t.key, e)}
-                                        >
-                                          <svg
-                                            className="s"
-                                            viewBox="0 0 24 24"
-                                            fill={isFav ? 'currentColor' : 'none'}
-                                            stroke="currentColor"
-                                            strokeWidth="2"
+                                          <button
+                                            type="button"
+                                            className={`qb ${isFav ? 'fav-on' : ''}`}
+                                            aria-label="Favoritar"
+                                            onClick={(e) => toggleFavorite(t.key, e)}
                                           >
+                                            <svg
+                                              key={isFav ? 'fav' : 'unfav'}
+                                              className="s"
+                                              viewBox="0 0 24 24"
+                                              fill={isFav ? 'currentColor' : 'none'}
+                                              stroke="currentColor"
+                                              strokeWidth="2"
+                                            >
                                             <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z" />
                                           </svg>
                                         </button>
@@ -4706,26 +5027,62 @@ export default function App() {
                 <b id="mt">{currentTrack.name}</b>
                 <small id="ma">{currentTrack.artist || ''}</small>
               </span>
-              <button
-                className={`ib ${isPlaying ? 'playing' : ''}`}
-                id="mplay"
-                aria-label="Tocar ou pausar"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  if (audioRef.current) {
-                    if (audioRef.current.paused) audioRef.current.play().catch(() => {});
-                    else audioRef.current.pause();
-                  }
-                }}
-              >
-                <svg className="pl" viewBox="0 0 24 24" fill="currentColor">
-                  <path d="M8 5.6v12.8a1 1 0 0 0 1.5.9l10.4-6.4a1 1 0 0 0 0-1.7L9.5 4.7A1 1 0 0 0 8 5.6z" />
-                </svg>
-                <svg className="pa" viewBox="0 0 24 24" fill="currentColor">
-                  <rect x="6" y="5" width="4.5" height="14" rx="1.5" />
-                  <rect x="13.5" y="5" width="4.5" height="14" rx="1.5" />
-                </svg>
-              </button>
+              <div className="mctrl" onClick={(e) => e.stopPropagation()}>
+                <button
+                  type="button"
+                  className="ib"
+                  id="mprev"
+                  title="Anterior"
+                  aria-label="Anterior"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    prevTrack();
+                  }}
+                >
+                  <svg viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M5.5 5h2v14h-2z" />
+                    <path d="M20 5.6v12.8a1 1 0 0 1-1.6.8L10 13.2a1.3 1.3 0 0 1 0-2.4l8.4-6a1 1 0 0 1 1.6.8z" />
+                  </svg>
+                </button>
+                <button
+                  type="button"
+                  className={`ib ${isPlaying ? 'playing' : ''}`}
+                  id="mplay"
+                  title={isPlaying ? 'Pausar' : 'Tocar'}
+                  aria-label="Tocar ou pausar"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (audioRef.current) {
+                      if (audioRef.current.paused) audioRef.current.play().catch(() => {});
+                      else audioRef.current.pause();
+                    }
+                  }}
+                >
+                  <svg className="pl" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M8 5.6v12.8a1 1 0 0 0 1.5.9l10.4-6.4a1 1 0 0 0 0-1.7L9.5 4.7A1 1 0 0 0 8 5.6z" />
+                  </svg>
+                  <svg className="pa" viewBox="0 0 24 24" fill="currentColor">
+                    <rect x="6" y="5" width="4.5" height="14" rx="1.5" />
+                    <rect x="13.5" y="5" width="4.5" height="14" rx="1.5" />
+                  </svg>
+                </button>
+                <button
+                  type="button"
+                  className="ib"
+                  id="mnext"
+                  title="Próxima"
+                  aria-label="Próxima"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    nextTrack(false);
+                  }}
+                >
+                  <svg viewBox="0 0 24 24" fill="currentColor" style={{ transform: 'scaleX(-1)' }}>
+                    <path d="M5.5 5h2v14h-2z" />
+                    <path d="M20 5.6v12.8a1 1 0 0 1-1.6.8L10 13.2a1.3 1.3 0 0 1 0-2.4l8.4-6a1 1 0 0 1 1.6.8z" />
+                  </svg>
+                </button>
+              </div>
             </div>
           )}
         </section>
@@ -5188,6 +5545,32 @@ export default function App() {
           </header>
 
           <div id="sbody">
+            {/* Instalar Aplicativo no Celular (PWA) */}
+            <div className="s-group">
+              <h3 className="s-group-title">Aplicativo no celular</h3>
+              <div className="s-card">
+                {isAppInstalled ? (
+                  <div className="s-row">
+                    <div className="s-row-info">
+                      <b>Vitrola já está instalado</b>
+                      <small>Você está executando o player como aplicativo dedicado no dispositivo</small>
+                    </div>
+                  </div>
+                ) : (
+                  <button type="button" className="s-btn install-cta-btn" onClick={handleInstallApp}>
+                    <svg className="s" viewBox="0 0 24 24">
+                      <rect x="6" y="2" width="12" height="20" rx="2.5" />
+                      <path d="M12 7v7m0 0-2.5-2.5M12 14l2.5-2.5M10 18h4" />
+                    </svg>
+                    <div className="s-btn-tx">
+                      <b>Instalar aplicativo no celular</b>
+                      <small>Adicione o Vitrola à tela inicial para abrir em tela cheia e usar offline</small>
+                    </div>
+                  </button>
+                )}
+              </div>
+            </div>
+
             {/* Resumo da Biblioteca */}
             <div className="s-group">
               <h3 className="s-group-title">Resumo da biblioteca</h3>
@@ -5506,6 +5889,104 @@ export default function App() {
                 >
                   Sim, remover
                 </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Mobile App Installation Guide Sheet */}
+        {isInstallGuideOpen && (
+          <div className="ctx-layer" role="dialog" aria-modal="true" aria-label="Instalar aplicativo no celular">
+            <div className="ctx-scrim" onClick={() => setIsInstallGuideOpen(false)} />
+            <div className="ctx-sheet install-sheet">
+              <span className="grip" />
+              <div className="ctx-head">
+                <div className="ctx-thumb install-thumb">
+                  <svg className="s" viewBox="0 0 24 24">
+                    <rect x="6" y="2" width="12" height="20" rx="2.5" />
+                    <path d="M12 7v7m0 0-2.5-2.5M12 14l2.5-2.5M10 18h4" />
+                  </svg>
+                </div>
+                <div className="ctx-meta">
+                  <b>Instalar Vitrola no celular</b>
+                  <small>Tenha acesso rápido na tela inicial e tela cheia</small>
+                </div>
+                <button
+                  type="button"
+                  className="ib"
+                  aria-label="Fechar"
+                  onClick={() => setIsInstallGuideOpen(false)}
+                >
+                  <svg className="s" viewBox="0 0 24 24">
+                    <path d="M6 6l12 12M18 6 6 18" />
+                  </svg>
+                </button>
+              </div>
+
+              <div className="install-steps">
+                {isInIframe && (
+                  <div className="install-step-card highlight">
+                    <div className="install-step-tx">
+                      <b>1. Abra diretamente no navegador</b>
+                      <small>
+                        Para que o celular mostre o botão nativo de instalação, abra o aplicativo fora da janela de
+                        pré-visualização:
+                      </small>
+                      <a
+                        href={window.location.href}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="install-open-link"
+                        onClick={() => setIsInstallGuideOpen(false)}
+                      >
+                        <svg className="s" viewBox="0 0 24 24">
+                          <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+                          <path d="M15 3h6v6" />
+                          <path d="M10 14 21 3" />
+                        </svg>
+                        <span>Abrir em nova guia para instalar</span>
+                      </a>
+                    </div>
+                  </div>
+                )}
+
+                {isIOSDevice ? (
+                  <div className="install-step-card">
+                    <div className="install-step-tx">
+                      <b>No iPhone ou iPad (Safari)</b>
+                      <small>
+                        1. Toque no ícone de <b>Compartilhar</b> na barra inferior do Safari.
+                        <br />
+                        2. Role a lista e toque em <b>Adicionar à Tela de Início</b>.
+                        <br />
+                        3. Confirme tocando em <b>Adicionar</b> no canto superior direito.
+                      </small>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <div className="install-step-card">
+                      <div className="install-step-tx">
+                        <b>No Android (Chrome / Samsung / Edge)</b>
+                        <small>
+                          1. Toque no menu de três pontos (<b>⋮</b>) no canto do navegador.
+                          <br />
+                          2. Selecione <b>Instalar aplicativo</b> ou <b>Adicionar à tela inicial</b>.
+                          <br />
+                          3. Confirme em <b>Instalar</b> para criar o atalho na tela inicial.
+                        </small>
+                      </div>
+                    </div>
+                    <div className="install-step-card">
+                      <div className="install-step-tx">
+                        <b>No iPhone ou iPad (Safari)</b>
+                        <small>
+                          Toque no botão <b>Compartilhar</b> e selecione <b>Adicionar à Tela de Início</b>.
+                        </small>
+                      </div>
+                    </div>
+                  </>
+                )}
               </div>
             </div>
           </div>
