@@ -2,6 +2,46 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <script>
+      (function () {
+        // In AI Studio preview, HMR WebSockets are disabled on the server.
+        // Intercept Vite's "vite-hmr" WebSocket so /@vite/client never throws
+        // "Error: WebSocket closed without opened."
+        var OrigWebSocket = window.WebSocket;
+        if (OrigWebSocket) {
+          var WrappedWebSocket = function (url, protocols) {
+            if (protocols === 'vite-hmr' || (Array.isArray(protocols) && protocols.indexOf('vite-hmr') !== -1)) {
+              return {
+                url: String(url || ''),
+                protocol: 'vite-hmr',
+                readyState: 1,
+                OPEN: 1,
+                CONNECTING: 0,
+                CLOSING: 2,
+                CLOSED: 3,
+                 bufferedAmount: 0,
+                extensions: '',
+                binaryType: 'blob',
+                send: function () {},
+                close: function () {},
+                addEventListener: function () {},
+                removeEventListener: function () {},
+                dispatchEvent: function () { return true; }
+              };
+            }
+            return protocols !== undefined
+              ? new OrigWebSocket(url, protocols)
+              : new OrigWebSocket(url);
+          };
+          WrappedWebSocket.prototype = OrigWebSocket.prototype;
+          WrappedWebSocket.CONNECTING = OrigWebSocket.CONNECTING;
+          WrappedWebSocket.OPEN = OrigWebSocket.OPEN;
+          WrappedWebSocket.CLOSING = OrigWebSocket.CLOSING;
+          WrappedWebSocket.CLOSED = OrigWebSocket.CLOSED;
+          window.WebSocket = WrappedWebSocket;
+        }
+      })();
+    </script>
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>Vitrola</title>
     <meta name="description" content="Player de música local idêntico ao Vitrola com suporte a tags ID3, letras sincronizadas, capas, artistas, álbuns e persistência local via IndexedDB." />
@@ -9,14 +49,37 @@
     <meta property="og:description" content="Player de música local idêntico ao Vitrola com suporte a tags ID3, letras sincronizadas, capas, artistas, álbuns e persistência local via IndexedDB." />
     <meta property="og:type" content="website" />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="theme-color" content="#8a4dff" />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f4f5f8" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#14171f" />
+    <meta name="theme-color" content="#14171f" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <meta name="apple-mobile-web-app-title" content="Vitrola" />
     <meta name="application-name" content="Vitrola" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
-    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <script>
+      (function () {
+        try {
+          var s = localStorage.getItem('vitrola_color_scheme');
+          if (s) document.documentElement.setAttribute('data-scheme', s);
+          var t = localStorage.getItem('vitrola_theme');
+          var isDark = t === 'dark' || ((!t || t === 'auto') && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+          var effective = t === 'dark' ? 'dark' : t === 'light' ? 'light' : (isDark ? 'dark' : 'light');
+          document.documentElement.setAttribute('data-theme', effective);
+          document.documentElement.style.colorScheme = effective;
+          var themeColor = effective === 'dark' ? '#14171f' : '#f4f5f8';
+          var metas = document.querySelectorAll('meta[name="theme-color"]');
+          metas.forEach(function (m) {
+            m.setAttribute('content', themeColor);
+          });
+          var manifest = document.querySelector('link[rel="manifest"]');
+          if (manifest) {
+            manifest.setAttribute('href', '/manifest.webmanifest?theme=' + effective);
+          }
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

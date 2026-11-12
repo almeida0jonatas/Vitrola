@@ -11,16 +11,25 @@ export default defineConfig(() => {
       tailwindcss(),
       VitePWA({
         registerType: 'autoUpdate',
-        includeAssets: ['apple-touch-icon.png', 'icon.svg', 'pwa-192x192.png', 'pwa-512x512.png', 'pwa-maskable-512x512.png'],
+        includeAssets: [
+          'apple-touch-icon.png',
+          'icon.svg',
+          'pwa-192x192.png',
+          'pwa-512x512.png',
+          'pwa-maskable-512x512.png',
+          'pwa-monochrome-512x512.png',
+        ],
         manifest: {
           id: '/',
-          name: 'Vitrola Music Player',
+          name: 'Vitrola',
           short_name: 'Vitrola',
           description:
             'Player de música local com suporte a tags ID3, letras sincronizadas, capas, artistas, álbuns e persistência local via IndexedDB.',
-          theme_color: '#8a4dff',
-          background_color: '#0e1015',
+          theme_color: '#14171f',
+          background_color: '#14171f',
           display: 'standalone',
+          orientation: 'portrait',
+          categories: ['music', 'entertainment'],
           start_url: '/',
           scope: '/',
           icons: [
@@ -41,6 +50,12 @@ export default defineConfig(() => {
               sizes: '512x512',
               type: 'image/png',
               purpose: 'maskable',
+            },
+            {
+              src: '/pwa-monochrome-512x512.png',
+              sizes: '512x512',
+              type: 'image/png',
+              purpose: 'monochrome',
             },
           ],
         },

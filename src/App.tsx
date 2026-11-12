@@ -23,8 +23,32 @@ import {
   albKey,
   shuffled,
   readTags,
+  RawTrackFileInfo,
+  inspectTrackFile,
+  extractAudioDurationFormatted,
 } from './utils/audioUtils.ts';
 import { createDemoTrackBlob } from './utils/demoAudio.ts';
+import {
+  Playlist,
+  createPlaylist,
+  addTracksToPlaylist,
+  removeTrackFromPlaylist,
+  reorderPlaylistTracks,
+  renamePlaylist,
+  duplicatePlaylist,
+  calculatePlaylistDuration,
+  generateM3uContent,
+  loadStoredPlaylists,
+  saveStoredPlaylists,
+} from './utils/playlistUtils.ts';
+import { PlaylistCollage } from './components/PlaylistCollage.tsx';
+import { PlaylistsView } from './components/PlaylistsView.tsx';
+import {
+  CreatePlaylistModal,
+  AddToPlaylistModal,
+  AddTracksToPlaylistModal,
+  ConfirmDeletePlaylistModal,
+} from './components/PlaylistModals.tsx';
 
 // IndexedDB helpers
 const DB_NAME = 'player-local';
@@ -67,6 +91,7 @@ interface StoredRecord {
   name: string;
   artist?: string;
   album?: string;
+  dur?: string;
   cover?: Blob | null;
   file: Blob;
 }
@@ -97,6 +122,56 @@ const dbDeleteMany = (ids: number[], keys: string[]) =>
         }
       };
     }
+  });
+
+const dbUpdateMeta = (metaByKey: Map<string, { name: string; artist?: string; album?: string }>) =>
+  dbRun<void>('readwrite', (store) => {
+    if (metaByKey.size === 0) return;
+    const cursorReq = store.openCursor();
+    cursorReq.onsuccess = () => {
+      const cursor = cursorReq.result;
+      if (cursor) {
+        const val = cursor.value as StoredRecord;
+        const m = val && metaByKey.get(val.key);
+        if (m) {
+          try {
+            cursor.update({
+              ...val,
+              name: m.name || val.name,
+              artist: m.artist ?? val.artist,
+              album: m.album ?? val.album,
+            });
+          } catch {
+            // ignore
+          }
+        }
+        cursor.continue();
+      }
+    };
+  });
+
+const dbUpdateDurations = (durByKey: Map<string, string>) =>
+  dbRun<void>('readwrite', (store) => {
+    if (durByKey.size === 0) return;
+    const cursorReq = store.openCursor();
+    cursorReq.onsuccess = () => {
+      const cursor = cursorReq.result;
+      if (cursor) {
+        const val = cursor.value as StoredRecord;
+        const dur = val && durByKey.get(val.key);
+        if (dur && val.dur !== dur) {
+          try {
+            cursor.update({
+              ...val,
+              dur,
+            });
+          } catch {
+            // ignore
+          }
+        }
+        cursor.continue();
+      }
+    };
   });
 
 const IK = 'info4:';
@@ -562,10 +637,29 @@ async function getLyrics(tr: Track, durationSec: number): Promise<{ synced?: str
   return res;
 }
 
+export type ColorSchemeId = 'blue' | 'purple' | 'emerald' | 'rose' | 'amber' | 'cyan' | 'crimson';
+
+export interface ColorSchemeOption {
+  id: ColorSchemeId;
+  label: string;
+  color: string;
+}
+
+export const COLOR_SCHEMES: ColorSchemeOption[] = [
+  { id: 'blue', label: 'Azul Elétrico', color: '#2b5cff' },
+  { id: 'purple', label: 'Roxo Vitrola', color: '#8b5cf6' },
+  { id: 'emerald', label: 'Verde Esmeralda', color: '#10b981' },
+  { id: 'rose', label: 'Rosa Magenta', color: '#f43f5e' },
+  { id: 'amber', label: 'Âmbar Vinil', color: '#f59e0b' },
+  { id: 'cyan', label: 'Ciano Oceano', color: '#06b6d4' },
+  { id: 'crimson', label: 'Vermelho Carmim', color: '#ef4444' },
+];
+
 export default function App() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const folderInputRef = useRef<HTMLInputElement | null>(null);
+  const backupInputRef = useRef<HTMLInputElement | null>(null);
   const [tracks, setTracks] = useState<Track[]>([]);
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [currentTime, setCurrentTime] = useState<number>(0);
@@ -589,11 +683,25 @@ export default function App() {
     }
   });
   const [isLyricsOpen, setIsLyricsOpen] = useState<boolean>(false);
-  const [libraryView, setLibraryView] = useState<'home' | 'tracks' | 'artists' | 'albums'>('home');
+  const [libraryView, setLibraryView] = useState<'home' | 'tracks' | 'artists' | 'albums' | 'playlists'>('home');
   const [artFilter, setArtFilter] = useState<string | null>(null);
   const [artSearchQuery, setArtSearchQuery] = useState<string>('');
   const [homeSearchQuery, setHomeSearchQuery] = useState<string>('');
-  const [pageStack, setPageStack] = useState<Array<{ t: 'artist' | 'album'; k: string }>>([]);
+  const [pageStack, setPageStack] = useState<Array<{ t: 'artist' | 'album' | 'playlist'; k: string }>>([]);
+
+  // Playlists State
+  const [playlists, setPlaylists] = useState<Playlist[]>(() => loadStoredPlaylists());
+  const [createPlaylistModalOpen, setCreatePlaylistModalOpen] = useState<boolean>(false);
+  const [editingPlaylist, setEditingPlaylist] = useState<Playlist | null>(null);
+  const [addToPlaylistModalOpen, setAddToPlaylistModalOpen] = useState<boolean>(false);
+  const [pendingTrackKeysForPlaylist, setPendingTrackKeysForPlaylist] = useState<string[]>([]);
+  const [pendingLabelForPlaylist, setPendingLabelForPlaylist] = useState<string>('');
+  const [addTracksToPlaylistModalOpen, setAddTracksToPlaylistModalOpen] = useState<boolean>(false);
+  const [confirmDeletePlaylist, setConfirmDeletePlaylist] = useState<Playlist | null>(null);
+
+  useEffect(() => {
+    saveStoredPlaylists(playlists);
+  }, [playlists]);
 
   // Play Counts (Most Played), Recently Played & Favorites
   const [playCounts, setPlayCounts] = useState<Record<string, number>>(() => {
@@ -684,20 +792,38 @@ export default function App() {
     }
     return 'auto';
   });
+  const [colorScheme, setColorScheme] = useState<ColorSchemeId>(() => {
+    try {
+      const saved = localStorage.getItem('vitrola_color_scheme') as ColorSchemeId | null;
+      if (
+        saved &&
+        ['blue', 'purple', 'emerald', 'rose', 'amber', 'cyan', 'crimson'].includes(saved)
+      ) {
+        return saved;
+      }
+    } catch {
+      // ignore
+    }
+    return 'blue';
+  });
 
   // Item Context Menu & Removal Confirmation Pop-up State
   const [actionMenu, setActionMenu] = useState<{
-    kind: 'track' | 'album' | 'artist';
+    kind: 'track' | 'album' | 'artist' | 'playlist';
     title: string;
     subtitle: string;
     cover?: string | null;
     trackIndices: number[];
     artistKey?: string;
     albumKey?: string;
+    playlistId?: string;
   } | null>(null);
+  const [showRawFileInfo, setShowRawFileInfo] = useState<boolean>(false);
+  const [rawFileInfo, setRawFileInfo] = useState<RawTrackFileInfo | null>(null);
+  const [rawFileInfoLoading, setRawFileInfoLoading] = useState<boolean>(false);
 
   const [confirmRemove, setConfirmRemove] = useState<{
-    kind: 'track' | 'album' | 'artist' | 'all_tracks';
+    kind: 'track' | 'album' | 'artist' | 'playlist' | 'all_tracks';
     title: string;
     trackIndices: number[];
   } | null>(null);
@@ -776,6 +902,39 @@ export default function App() {
   const currentIndex = queueIndex >= 0 && queueIndex < queue.length ? queue[queueIndex].trackIdx : -1;
   const currentTrack = currentIndex >= 0 && currentIndex < tracks.length ? tracks[currentIndex] : null;
 
+  // Inspect raw file metadata whenever the 3-dots menu is opened for a single track
+  useEffect(() => {
+    setShowRawFileInfo(false);
+    setRawFileInfo(null);
+    setRawFileInfoLoading(false);
+
+    if (!actionMenu || actionMenu.kind !== 'track' || actionMenu.trackIndices.length === 0) {
+      return;
+    }
+
+    const tr = tracks[actionMenu.trackIndices[0]];
+    if (!tr) return;
+
+    let cancelled = false;
+    setRawFileInfoLoading(true);
+    inspectTrackFile(tr)
+      .then((info) => {
+        if (!cancelled) {
+          setRawFileInfo(info);
+          setRawFileInfoLoading(false);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setRawFileInfoLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [actionMenu, tracks]);
+
   // Track title overflow measurement for sliding animation
   const [titleOverflow, setTitleOverflow] = useState<{ isOverflowing: boolean; dist: number; dur: number }>({
     isOverflowing: false,
@@ -851,22 +1010,6 @@ export default function App() {
     return formatQueueSummaryDuration(totalSec);
   }, [upcomingItems, tracks]);
 
-  // Sync mediaSession
-  useEffect(() => {
-    if ('mediaSession' in navigator && currentTrack) {
-      try {
-        navigator.mediaSession.metadata = new MediaMetadata({
-          title: currentTrack.name,
-          artist: currentTrack.artist || '',
-          album: currentTrack.album || '',
-          artwork: currentTrack.cover || currentTrack.web ? [{ src: currentTrack.cover || currentTrack.web! }] : [],
-        });
-      } catch {
-        // continue
-      }
-    }
-  }, [currentTrack]);
-
   const hasRestoredRef = useRef<boolean>(false);
   const pendingPosRef = useRef<number>(0);
 
@@ -898,8 +1041,10 @@ export default function App() {
           name: r.name,
           artist: r.artist,
           album: r.album,
+          dur: r.dur,
           cover: r.cover ? URL.createObjectURL(r.cover) : null,
           url: URL.createObjectURL(r.file),
+          file: r.file,
         });
       }
       setTracks(loaded);
@@ -1005,6 +1150,66 @@ export default function App() {
       }
     })();
   }, [showToast]);
+
+  // Automatically hydrate missing track durations from stored Blobs/URLs (prioritizing playlist tracks)
+  const hydratedDurKeysRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const missing = tracks.filter(
+      (t) => !t.dur && (t.file || t.url) && !hydratedDurKeysRef.current.has(t.key)
+    );
+    if (missing.length === 0) return;
+
+    const playlistKeySet = new Set<string>();
+    playlists.forEach((pl) => pl.trackKeys.forEach((k) => playlistKeySet.add(k)));
+
+    // Sort so playlist tracks are hydrated first
+    const ordered = [...missing].sort((a, b) => {
+      const aInPl = playlistKeySet.has(a.key) ? 0 : 1;
+      const bInPl = playlistKeySet.has(b.key) ? 0 : 1;
+      return aInPl - bInPl;
+    });
+
+    ordered.forEach((t) => hydratedDurKeysRef.current.add(t.key));
+
+    let cancelled = false;
+    (async () => {
+      const BATCH_SIZE = 16;
+      const allResolved = new Map<string, string>();
+
+      for (let i = 0; i < ordered.length; i += BATCH_SIZE) {
+        if (cancelled) return;
+        const chunk = ordered.slice(i, i + BATCH_SIZE);
+        const batchResolved = new Map<string, string>();
+
+        await Promise.all(
+          chunk.map(async (tr) => {
+            const dur = await extractAudioDurationFormatted(tr.file, tr.url);
+            if (dur) {
+              batchResolved.set(tr.key, dur);
+              allResolved.set(tr.key, dur);
+            }
+          })
+        );
+
+        if (!cancelled && batchResolved.size > 0) {
+          setTracks((prev) =>
+            prev.map((tr) => {
+              const d = batchResolved.get(tr.key);
+              return d && !tr.dur ? { ...tr, dur: d } : tr;
+            })
+          );
+        }
+      }
+
+      if (allResolved.size > 0) {
+        await dbUpdateDurations(allResolved);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [tracks, playlists]);
 
   // Save playback state to localStorage
   const saveState = useCallback(() => {
@@ -1162,6 +1367,113 @@ export default function App() {
     },
     [queueIndex, queue, repeat, loadAudio]
   );
+
+  // Sync MediaSession Metadata, Playback State, Position & Action Handlers (Android / iOS Lockscreen & Notification)
+  useEffect(() => {
+    if (!('mediaSession' in navigator) || !currentTrack) return;
+    try {
+      const curAlbK = albKey(currentTrack);
+      const coverSrc =
+        currentTrack.cover ||
+        currentTrack.web ||
+        (curAlbK && albumCoverCache[curAlbK] && albumCoverCache[curAlbK] !== 'none'
+          ? albumCoverCache[curAlbK]
+          : undefined);
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: currentTrack.name,
+        artist: currentTrack.artist || '',
+        album: currentTrack.album || '',
+        artwork: coverSrc ? [{ src: coverSrc }] : [],
+      });
+    } catch {
+      // continue
+    }
+  }, [currentTrack, albumCoverCache]);
+
+  useEffect(() => {
+    if (!('mediaSession' in navigator)) return;
+    const ms = navigator.mediaSession;
+
+    const safeSetHandler = (action: MediaSessionAction, handler: MediaSessionActionHandler | null) => {
+      try {
+        ms.setActionHandler(action, handler);
+      } catch {
+        // Ignore unsupported MediaSession actions on older browsers
+      }
+    };
+
+    safeSetHandler('play', () => {
+      if (audioRef.current) {
+        audioRef.current.play().catch(() => {});
+      }
+    });
+
+    safeSetHandler('pause', () => {
+      if (audioRef.current) {
+        audioRef.current.pause();
+      }
+    });
+
+    safeSetHandler('previoustrack', () => {
+      prevTrack(false);
+    });
+
+    safeSetHandler('nexttrack', () => {
+      nextTrack(false);
+    });
+
+    safeSetHandler('seekbackward', (details) => {
+      if (audioRef.current) {
+        const skip = details.seekOffset || 10;
+        audioRef.current.currentTime = Math.max(0, audioRef.current.currentTime - skip);
+      }
+    });
+
+    safeSetHandler('seekforward', (details) => {
+      if (audioRef.current) {
+        const skip = details.seekOffset || 10;
+        const maxDur = Number.isFinite(audioRef.current.duration) ? audioRef.current.duration : 0;
+        audioRef.current.currentTime = maxDur ? Math.min(maxDur, audioRef.current.currentTime + skip) : audioRef.current.currentTime + skip;
+      }
+    });
+
+    safeSetHandler('seekto', (details) => {
+      if (audioRef.current && typeof details.seekTime === 'number') {
+        if (details.fastSeek && 'fastSeek' in audioRef.current) {
+          audioRef.current.fastSeek(details.seekTime);
+        } else {
+          audioRef.current.currentTime = details.seekTime;
+        }
+        setCurrentTime(details.seekTime);
+      }
+    });
+
+    return () => {
+      safeSetHandler('play', null);
+      safeSetHandler('pause', null);
+      safeSetHandler('previoustrack', null);
+      safeSetHandler('nexttrack', null);
+      safeSetHandler('seekbackward', null);
+      safeSetHandler('seekforward', null);
+      safeSetHandler('seekto', null);
+    };
+  }, [prevTrack, nextTrack]);
+
+  useEffect(() => {
+    if (!('mediaSession' in navigator)) return;
+    try {
+      navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
+      if (duration > 0 && Number.isFinite(duration) && 'setPositionState' in navigator.mediaSession) {
+        navigator.mediaSession.setPositionState({
+          duration,
+          playbackRate: playbackSpeed || 1,
+          position: Math.max(0, Math.min(currentTime, duration)),
+        });
+      }
+    } catch {
+      // continue
+    }
+  }, [isPlaying, duration, currentTime, playbackSpeed]);
 
   // Album cover horizontal swipe state (Left -> Next, Right -> Previous)
   const [coverDragX, setCoverDragX] = useState<number>(0);
@@ -1679,13 +1991,18 @@ export default function App() {
           }
         }
 
+        const objUrl = URL.createObjectURL(f);
+        const extractedDur = await extractAudioDurationFormatted(f, objUrl);
+
         const tr: Track = {
           key,
           name: g.title || cleanFileName,
           artist: fallbackArtist,
           album: fallbackAlbum,
+          dur: extractedDur,
           cover: g.cover,
-          url: URL.createObjectURL(f),
+          url: objUrl,
+          file: f,
         };
         newTracks.push(tr);
         addedCount++;
@@ -1694,6 +2011,7 @@ export default function App() {
           name: tr.name,
           artist: tr.artist,
           album: tr.album,
+          dur: tr.dur,
           cover: g.coverBlob || null,
           file: f,
         });
@@ -1771,6 +2089,7 @@ export default function App() {
           album: config.album,
           url: URL.createObjectURL(blob),
           dur: '0:16',
+          file: blob,
         };
         newTracks.push(tr);
         const id = await dbPut({
@@ -1911,6 +2230,494 @@ export default function App() {
     showToast('Cache de letras e traduções apagado');
   };
 
+  // Export library metadata, settings, and exact player state as a JSON backup file
+  const handleExportBackup = useCallback(() => {
+    try {
+      const a = audioRef.current;
+      const exactPos =
+        a && Number.isFinite(a.currentTime) && a.currentTime > 0
+          ? Number(a.currentTime.toFixed(2))
+          : Number((currentTime || 0).toFixed(2));
+      const exactDur =
+        a && Number.isFinite(a.duration) && a.duration > 0
+          ? Number(a.duration.toFixed(2))
+          : Number((duration || 0).toFixed(2));
+
+      const lsCache: Record<string, string> = {};
+      try {
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i);
+          if (k && (k.startsWith(IK) || k.startsWith('lyr1:') || k.startsWith('ltrans1:'))) {
+            const v = localStorage.getItem(k);
+            if (v) lsCache[k] = v;
+          }
+        }
+      } catch {
+        // ignore
+      }
+
+      const backupPayload = {
+        app: 'Vitrola',
+        version: 1,
+        createdAt: new Date().toISOString(),
+        settings: {
+          themePref,
+          colorScheme,
+          playbackSpeed,
+          sleepTimerMinutes,
+          lyricsMode,
+        },
+        playerState: {
+          currentTrackKey: currentTrack?.key || null,
+          currentTrackName: currentTrack?.name || null,
+          currentTrackArtist: currentTrack?.artist || null,
+          currentTrackAlbum: currentTrack?.album || null,
+          currentTime: exactPos,
+          duration: exactDur,
+          isPlaying: Boolean(isPlaying),
+          shuffle,
+          repeat,
+          volume: a ? a.volume : 1,
+          queueIndex,
+          queueContextTitle,
+          libraryView,
+          queue: queue
+            .map((item) => {
+              const tr = tracks[item.trackIdx];
+              if (!tr) return null;
+              return {
+                key: tr.key,
+                name: tr.name,
+                artist: tr.artist || '',
+                album: tr.album || '',
+                isManual: Boolean(item.isManual),
+                origIdx: item.origIdx,
+              };
+            })
+            .filter(Boolean),
+        },
+        library: {
+          totalTracks: tracks.length,
+          tracks: tracks.map((t) => ({
+            key: t.key,
+            name: t.name,
+            artist: t.artist || '',
+            album: t.album || '',
+            dur: t.dur || undefined,
+            web: t.web || undefined,
+          })),
+          playlists,
+          favoriteKeys,
+          playCounts,
+          recentKeys,
+          artistAvatarCache,
+          albumCoverCache,
+          localStorageCache: lsCache,
+        },
+      };
+
+      const jsonStr = JSON.stringify(backupPayload, null, 2);
+      const blob = new Blob([jsonStr], { type: 'application/json;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const dateStamp = new Date().toISOString().slice(0, 10);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `vitrola-backup-${dateStamp}.json`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+
+      showToast('Backup JSON exportado com sucesso!');
+    } catch {
+      showToast('Erro ao exportar o arquivo de backup');
+    }
+  }, [
+    currentTime,
+    duration,
+    themePref,
+    colorScheme,
+    playbackSpeed,
+    sleepTimerMinutes,
+    lyricsMode,
+    currentTrack,
+    isPlaying,
+    shuffle,
+    repeat,
+    queueIndex,
+    queueContextTitle,
+    libraryView,
+    queue,
+    tracks,
+    favoriteKeys,
+    playCounts,
+    recentKeys,
+    artistAvatarCache,
+    albumCoverCache,
+    showToast,
+  ]);
+
+  // Restore library metadata, settings, and exact player state from a JSON backup file
+  const handleImportBackupFile = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      e.target.value = '';
+      if (!file) return;
+
+      try {
+        const text = await file.text();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const parsed: any = JSON.parse(text);
+        if (!parsed || typeof parsed !== 'object') {
+          showToast('Arquivo de backup inválido');
+          return;
+        }
+
+        // 1. Restore Settings
+        const st = parsed.settings || {};
+        if (st.themePref === 'auto' || st.themePref === 'dark' || st.themePref === 'light') {
+          setThemePref(st.themePref);
+          try {
+            localStorage.setItem('vitrola_theme', st.themePref);
+          } catch {
+            // ignore
+          }
+        }
+        if (
+          typeof st.colorScheme === 'string' &&
+          ['blue', 'purple', 'emerald', 'rose', 'amber', 'cyan', 'crimson'].includes(st.colorScheme)
+        ) {
+          setColorScheme(st.colorScheme as ColorSchemeId);
+          try {
+            localStorage.setItem('vitrola_color_scheme', st.colorScheme);
+          } catch {
+            // ignore
+          }
+        }
+        const restoredSpeed =
+          typeof st.playbackSpeed === 'number' && st.playbackSpeed >= 0.5 && st.playbackSpeed <= 3
+            ? st.playbackSpeed
+            : playbackSpeed;
+        setPlaybackSpeed(restoredSpeed);
+        if (audioRef.current) {
+          audioRef.current.playbackRate = restoredSpeed;
+        }
+        if (typeof st.sleepTimerMinutes === 'number' && st.sleepTimerMinutes >= 0) {
+          setSleepTimerMinutes(st.sleepTimerMinutes);
+        }
+        if (
+          st.lyricsMode === 'original' ||
+          st.lyricsMode === 'translated' ||
+          st.lyricsMode === 'bilingual'
+        ) {
+          setLyricsMode(st.lyricsMode);
+          try {
+            localStorage.setItem('vitrola_lmode', st.lyricsMode);
+          } catch {
+            // ignore
+          }
+        }
+
+        // 2. Restore Library Playlists, Favorites, Play Counts, Recent History & Caches
+        const lib = parsed.library || parsed;
+        if (Array.isArray(lib.playlists)) {
+          setPlaylists(lib.playlists);
+        }
+        if (Array.isArray(lib.favoriteKeys)) {
+          setFavoriteKeys(lib.favoriteKeys);
+          try {
+            localStorage.setItem('vitrola_favs1', JSON.stringify(lib.favoriteKeys));
+          } catch {
+            // ignore
+          }
+        }
+        if (lib.playCounts && typeof lib.playCounts === 'object') {
+          setPlayCounts(lib.playCounts);
+          try {
+            localStorage.setItem('vitrola_playcounts1', JSON.stringify(lib.playCounts));
+          } catch {
+            // ignore
+          }
+        }
+        if (Array.isArray(lib.recentKeys)) {
+          setRecentKeys(lib.recentKeys);
+          try {
+            localStorage.setItem('vitrola_recent1', JSON.stringify(lib.recentKeys));
+          } catch {
+            // ignore
+          }
+        }
+        if (lib.artistAvatarCache && typeof lib.artistAvatarCache === 'object') {
+          setArtistAvatarCache((prev) => ({ ...prev, ...lib.artistAvatarCache }));
+        }
+        if (lib.albumCoverCache && typeof lib.albumCoverCache === 'object') {
+          setAlbumCoverCache((prev) => ({ ...prev, ...lib.albumCoverCache }));
+        }
+        if (lib.localStorageCache && typeof lib.localStorageCache === 'object') {
+          try {
+            Object.entries(lib.localStorageCache).forEach(([k, v]) => {
+              if (typeof v === 'string') {
+                localStorage.setItem(k, v);
+              }
+            });
+          } catch {
+            // ignore
+          }
+        }
+
+        // 3. Apply backed-up track metadata (name, artist, album, dur, web) to current tracks
+        const backupTracksList: Array<{
+          key?: string;
+          name?: string;
+          artist?: string;
+          album?: string;
+          dur?: string;
+          web?: string;
+        }> = Array.isArray(lib.tracks) ? lib.tracks : [];
+
+        const metaByKey = new Map<
+          string,
+          { name: string; artist?: string; album?: string; dur?: string; web?: string }
+        >();
+        const metaByNameArtist = new Map<
+          string,
+          { key?: string; name: string; artist?: string; album?: string; dur?: string; web?: string }
+        >();
+
+        backupTracksList.forEach((bt) => {
+          if (!bt || !bt.name) return;
+          const entry = {
+            key: bt.key,
+            name: bt.name,
+            artist: bt.artist || undefined,
+            album: bt.album || undefined,
+            dur: bt.dur || undefined,
+            web: bt.web || undefined,
+          };
+          if (bt.key) {
+            metaByKey.set(bt.key, entry);
+          }
+          metaByNameArtist.set(`${nrm(bt.name)}|${nrm(bt.artist)}`, entry);
+          metaByNameArtist.set(`${nrm(bt.name)}|`, entry);
+        });
+
+        try {
+          if (backupTracksList.length > 0) {
+            localStorage.setItem('vitrola_backup_meta1', JSON.stringify(backupTracksList));
+          }
+        } catch {
+          // ignore
+        }
+
+        let updatedTracks = [...tracks];
+        if (updatedTracks.length > 0 && backupTracksList.length > 0) {
+          const idbUpdates = new Map<string, { name: string; artist?: string; album?: string }>();
+          updatedTracks = updatedTracks.map((tr) => {
+            const match =
+              metaByKey.get(tr.key) ||
+              metaByNameArtist.get(`${nrm(tr.name)}|${nrm(tr.artist)}`) ||
+              metaByNameArtist.get(`${nrm(tr.name)}|`);
+            if (!match) return tr;
+            const nextTr: Track = {
+              ...tr,
+              name: match.name || tr.name,
+              artist: match.artist ?? tr.artist,
+              album: match.album ?? tr.album,
+              dur: match.dur || tr.dur,
+              web: match.web || tr.web,
+            };
+            idbUpdates.set(tr.key, {
+              name: nextTr.name,
+              artist: nextTr.artist,
+              album: nextTr.album,
+            });
+            return nextTr;
+          });
+          setTracks(updatedTracks);
+          if (idbUpdates.size > 0) {
+            await dbUpdateMeta(idbUpdates);
+          }
+        }
+
+        // 4. Restore Exact Player State (queue, active track, position, shuffle, repeat, playing status)
+        const ps = parsed.playerState;
+        if (ps && typeof ps === 'object') {
+          if (typeof ps.shuffle === 'boolean') setShuffle(ps.shuffle);
+          if (ps.repeat === 0 || ps.repeat === 1 || ps.repeat === 2) setRepeat(ps.repeat);
+          if (typeof ps.queueContextTitle === 'string' && ps.queueContextTitle) {
+            setQueueContextTitle(ps.queueContextTitle);
+          }
+          if (
+            ps.libraryView === 'home' ||
+            ps.libraryView === 'tracks' ||
+            ps.libraryView === 'artists' ||
+            ps.libraryView === 'albums' ||
+            ps.libraryView === 'playlists'
+          ) {
+            setLibraryView(ps.libraryView);
+          }
+
+          // Build lookup maps for currently loaded tracks
+          const idxByKey = new Map<string, number>();
+          const idxByNameArtist = new Map<string, number>();
+          const idxByNameOnly = new Map<string, number>();
+          updatedTracks.forEach((t, i) => {
+            idxByKey.set(t.key, i);
+            idxByNameArtist.set(`${nrm(t.name)}|${nrm(t.artist)}`, i);
+            if (!idxByNameOnly.has(nrm(t.name))) {
+              idxByNameOnly.set(nrm(t.name), i);
+            }
+          });
+
+          const resolveTrackIndex = (
+            key?: string | null,
+            name?: string | null,
+            artist?: string | null
+          ): number | undefined => {
+            if (key && idxByKey.has(key)) return idxByKey.get(key);
+            if (name) {
+              const na = `${nrm(name)}|${nrm(artist || '')}`;
+              if (idxByNameArtist.has(na)) return idxByNameArtist.get(na);
+              const nOnly = nrm(name);
+              if (idxByNameOnly.has(nOnly)) return idxByNameOnly.get(nOnly);
+            }
+            return undefined;
+          };
+
+          // Persist pstate1 so even if audio files are imported later or page reloads, state is ready
+          try {
+            localStorage.setItem(
+              'pstate1',
+              JSON.stringify({
+                cur: ps.currentTrackKey || null,
+                pos: typeof ps.currentTime === 'number' ? ps.currentTime : 0,
+                playing: Boolean(ps.isPlaying),
+                queue: Array.isArray(ps.queue) ? ps.queue : [],
+                queueIndex: typeof ps.queueIndex === 'number' ? ps.queueIndex : 0,
+                contextTitle: ps.queueContextTitle || 'Biblioteca',
+                shuf: Boolean(ps.shuffle),
+                rep: typeof ps.repeat === 'number' ? ps.repeat : 0,
+                vol: typeof ps.volume === 'number' ? ps.volume : 1,
+              })
+            );
+          } catch {
+            // ignore
+          }
+
+          if (updatedTracks.length > 0) {
+            let restoredQueue: QueueItem[] = [];
+            if (Array.isArray(ps.queue) && ps.queue.length > 0) {
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              ps.queue.forEach((qItem: any, i: number) => {
+                const matchedIdx = resolveTrackIndex(
+                  typeof qItem === 'string' ? qItem : qItem?.key,
+                  qItem?.name,
+                  qItem?.artist
+                );
+                if (matchedIdx != null) {
+                  restoredQueue.push({
+                    uid: `bkp-${matchedIdx}-${i}-${Date.now()}`,
+                    trackIdx: matchedIdx,
+                    isManual: Boolean(qItem?.isManual),
+                    origIdx: typeof qItem?.origIdx === 'number' ? qItem.origIdx : matchedIdx,
+                  });
+                }
+              });
+            }
+
+            if (restoredQueue.length === 0) {
+              restoredQueue = updatedTracks.map((_, i) => ({
+                uid: `bkp-init-${i}-${Date.now()}`,
+                trackIdx: i,
+                origIdx: i,
+              }));
+            }
+
+            const curTrackIdx = resolveTrackIndex(
+              ps.currentTrackKey,
+              ps.currentTrackName,
+              ps.currentTrackArtist
+            );
+
+            let targetQIdx = 0;
+            if (
+              typeof ps.queueIndex === 'number' &&
+              ps.queueIndex >= 0 &&
+              ps.queueIndex < restoredQueue.length &&
+              (curTrackIdx == null || restoredQueue[ps.queueIndex].trackIdx === curTrackIdx)
+            ) {
+              targetQIdx = ps.queueIndex;
+            } else if (curTrackIdx != null) {
+              const foundInQ = restoredQueue.findIndex((q) => q.trackIdx === curTrackIdx);
+              if (foundInQ >= 0) {
+                targetQIdx = foundInQ;
+              } else {
+                restoredQueue.unshift({
+                  uid: `bkp-cur-${curTrackIdx}-${Date.now()}`,
+                  trackIdx: curTrackIdx,
+                  origIdx: curTrackIdx,
+                });
+                targetQIdx = 0;
+              }
+            }
+
+            setQueue(restoredQueue);
+            setQueueIndex(targetQIdx);
+
+            const targetTrack = updatedTracks[restoredQueue[targetQIdx]?.trackIdx ?? 0];
+            if (targetTrack && audioRef.current) {
+              const a = audioRef.current;
+              const savedPos =
+                typeof ps.currentTime === 'number' && ps.currentTime >= 0 ? ps.currentTime : 0;
+              const shouldPlay = Boolean(ps.isPlaying);
+
+              if (typeof ps.volume === 'number' && ps.volume >= 0 && ps.volume <= 1) {
+                a.volume = ps.volume;
+              }
+              a.playbackRate = restoredSpeed;
+              a.src = targetTrack.url;
+              pendingPosRef.current = savedPos;
+              setCurrentTime(savedPos);
+              if (typeof ps.duration === 'number' && ps.duration > 0) {
+                setDuration(ps.duration);
+              }
+
+              a.addEventListener(
+                'loadedmetadata',
+                () => {
+                  try {
+                    if (audioRef.current) {
+                      if (savedPos > 0 && savedPos < (audioRef.current.duration || Infinity)) {
+                        audioRef.current.currentTime = savedPos;
+                        setCurrentTime(savedPos);
+                      }
+                      audioRef.current.playbackRate = restoredSpeed;
+                      pendingPosRef.current = 0;
+                      if (shouldPlay) {
+                        audioRef.current.play().catch(() => {});
+                      } else {
+                        audioRef.current.pause();
+                        setIsPlaying(false);
+                      }
+                    }
+                  } catch {
+                    // ignore
+                  }
+                },
+                { once: true }
+              );
+            }
+          }
+        }
+
+        showToast('Backup e estado do player restaurados com sucesso!');
+      } catch {
+        showToast('Não foi possível ler o arquivo JSON de backup');
+      }
+    },
+    [tracks, playbackSpeed, showToast]
+  );
+
   // Apply theme preference
   useEffect(() => {
     const root = document.documentElement;
@@ -1927,6 +2734,24 @@ export default function App() {
           : 'light';
       root.setAttribute('data-theme', effective);
       root.style.colorScheme = effective;
+
+      // Dynamically update mobile browser/Android system status and navigation bar color
+      const themeColor = effective === 'dark' ? '#14171f' : '#f4f5f8';
+      const metas = document.querySelectorAll('meta[name="theme-color"]');
+      if (metas.length > 0) {
+        metas.forEach((m) => m.setAttribute('content', themeColor));
+      } else {
+        const meta = document.createElement('meta');
+        meta.name = 'theme-color';
+        meta.content = themeColor;
+        document.head.appendChild(meta);
+      }
+
+      // Update manifest link so Android Chrome navigation bar matches the current theme
+      const manifest = document.querySelector('link[rel="manifest"]') as HTMLLinkElement | null;
+      if (manifest) {
+        manifest.href = `/manifest.webmanifest?theme=${effective}`;
+      }
     };
 
     applyTheme();
@@ -1944,6 +2769,17 @@ export default function App() {
       }
     }
   }, [themePref]);
+
+  // Synchronize chosen Color Scheme to documentElement via data-scheme attribute
+  useEffect(() => {
+    const root = document.documentElement;
+    root.setAttribute('data-scheme', colorScheme);
+    try {
+      localStorage.setItem('vitrola_color_scheme', colorScheme);
+    } catch {
+      // ignore
+    }
+  }, [colorScheme]);
 
   // Apply playback speed to audio element
   useEffect(() => {
@@ -2068,6 +2904,9 @@ export default function App() {
     if (pageStack.length > 0) {
       setPageStack((prev) =>
         prev.filter((p) => {
+          if (p.t === 'playlist') {
+            return playlists.some((pl) => pl.id === p.k);
+          }
           if (p.t === 'artist') {
             return remainingTracks.some((t) => nrm(artKey(t)) === nrm(p.k));
           }
@@ -2475,11 +3314,40 @@ export default function App() {
     loadAudio(queue[targetIdx].trackIdx, true);
   };
 
-  // Active page detail for artist/album
+  // Fast cover lookup map for tracks
+  const coverMap = useMemo(() => {
+    const map = new Map<string, string | null | undefined>();
+    for (const t of tracks) {
+      const c =
+        t.cover ||
+        t.web ||
+        (albumCoverCache[albKey(t)] && albumCoverCache[albKey(t)] !== 'none'
+          ? albumCoverCache[albKey(t)]
+          : undefined);
+      map.set(t.key, c);
+    }
+    return map;
+  }, [tracks, albumCoverCache]);
+
+  // Track key to index map for O(1) lookups
+  const trackIndexByKey = useMemo(() => {
+    const map = new Map<string, number>();
+    tracks.forEach((t, idx) => {
+      if (t.key) map.set(t.key, idx);
+    });
+    return map;
+  }, [tracks]);
+
+  // Active page detail for artist/album/playlist
   const activePage = pageStack.length ? pageStack[pageStack.length - 1] : null;
 
+  const activePlaylist = useMemo(() => {
+    if (!activePage || activePage.t !== 'playlist') return null;
+    return playlists.find((p) => p.id === activePage.k) || null;
+  }, [activePage, playlists]);
+
   useEffect(() => {
-    if (!activePage) {
+    if (!activePage || activePage.t === 'playlist') {
       setActivePageInfo(null);
       return;
     }
@@ -2503,6 +3371,12 @@ export default function App() {
   // Page tracks
   const pageTrackIndices = useMemo(() => {
     if (!activePage) return [];
+    if (activePage.t === 'playlist') {
+      if (!activePlaylist) return [];
+      return activePlaylist.trackKeys
+        .map((k) => trackIndexByKey.get(k))
+        .filter((idx): idx is number => idx !== undefined);
+    }
     const isArtist = activePage.t === 'artist';
     const targetNormArtist = isArtist ? nrm(activePage.k) : '';
     const [targetAlb, targetAlbArt] = !isArtist ? activePage.k.split('||') : ['', ''];
@@ -2518,10 +3392,56 @@ export default function App() {
         return trackNormAlb === targetNormAlb;
       })
       .map(({ idx }) => idx);
-  }, [activePage, tracks]);
+  }, [activePage, activePlaylist, trackIndexByKey, tracks]);
 
-  // Cover image URL for background blur
-  const currentCoverUrl = currentTrack ? currentTrack.cover || currentTrack.web : null;
+  // Playlist handlers
+  const exportPlaylistM3u = useCallback(
+    (pl: Playlist) => {
+      const plTracks = pl.trackKeys
+        .map((k) => tracks.find((t) => t.key === k))
+        .filter((t): t is Track => Boolean(t));
+      const m3uContent = generateM3uContent(pl, plTracks);
+      const blob = new Blob([m3uContent], { type: 'audio/x-mpegurl;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${pl.name.replace(/[/\\?%*:|"<>]/g, '_')}.m3u`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+      showToast('Playlist exportada (.m3u)');
+    },
+    [tracks, showToast]
+  );
+
+  const createPlaylistFromFavorites = useCallback(() => {
+    if (favoriteKeys.length === 0) {
+      showToast('Nenhuma música favoritada ainda');
+      return;
+    }
+    const newPl = createPlaylist('Suas Favoritas', 'Músicas que você curtiu no player', favoriteKeys);
+    setPlaylists((prev) => [newPl, ...prev]);
+    showToast('Playlist criada a partir das Favoritas!');
+    setLibraryView('playlists');
+    setPageStack([{ t: 'playlist', k: newPl.id }]);
+  }, [favoriteKeys, showToast]);
+
+  // Cover image URL for background blur and main player cover
+  const currentCoverUrl = useMemo(() => {
+    if (!currentTrack) return null;
+    if (currentTrack.cover) return currentTrack.cover;
+    if (currentTrack.web) return currentTrack.web;
+    const curAlbK = albKey(currentTrack);
+    if (curAlbK && albumCoverCache[curAlbK] && albumCoverCache[curAlbK] !== 'none') {
+      return albumCoverCache[curAlbK];
+    }
+    const curArtK = artKey(currentTrack);
+    if (curArtK && artistAvatarCache[curArtK] && artistAvatarCache[curArtK] !== 'none') {
+      return artistAvatarCache[curArtK];
+    }
+    return null;
+  }, [currentTrack, albumCoverCache, artistAvatarCache]);
 
   // Has cover flag for body class
   useEffect(() => {
@@ -2890,24 +3810,41 @@ export default function App() {
               </div>
             </div>
             {currentTrack && (
-              <button
-                type="button"
-                className={`qb ${favoriteKeys.includes(currentTrack.key) ? 'fav-on' : ''}`}
-                title={favoriteKeys.includes(currentTrack.key) ? 'Remover das Favoritas' : 'Adicionar às Favoritas'}
-                aria-label="Favoritar música"
-                onClick={(e) => toggleFavorite(currentTrack.key, e)}
-              >
-                <svg
-                  key={favoriteKeys.includes(currentTrack.key) ? 'fav' : 'unfav'}
-                  className="s"
-                  viewBox="0 0 24 24"
-                  fill={favoriteKeys.includes(currentTrack.key) ? 'currentColor' : 'none'}
-                  stroke="currentColor"
-                  strokeWidth="2"
+              <div style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+                <button
+                  type="button"
+                  className="qb"
+                  title="Adicionar à playlist"
+                  aria-label="Adicionar música atual à playlist"
+                  onClick={() => {
+                    setPendingTrackKeysForPlaylist([currentTrack.key]);
+                    setPendingLabelForPlaylist(`Música: ${currentTrack.name}`);
+                    setAddToPlaylistModalOpen(true);
+                  }}
                 >
-                  <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z" />
-                </svg>
-              </button>
+                  <svg className="s" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M12 5v14M5 12h14" />
+                  </svg>
+                </button>
+                <button
+                  type="button"
+                  className={`qb ${favoriteKeys.includes(currentTrack.key) ? 'fav-on' : ''}`}
+                  title={favoriteKeys.includes(currentTrack.key) ? 'Remover das Favoritas' : 'Adicionar às Favoritas'}
+                  aria-label="Favoritar música"
+                  onClick={(e) => toggleFavorite(currentTrack.key, e)}
+                >
+                  <svg
+                    key={favoriteKeys.includes(currentTrack.key) ? 'fav' : 'unfav'}
+                    className="s"
+                    viewBox="0 0 24 24"
+                    fill={favoriteKeys.includes(currentTrack.key) ? 'currentColor' : 'none'}
+                    stroke="currentColor"
+                    strokeWidth="2"
+                  >
+                    <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z" />
+                  </svg>
+                </button>
+              </div>
             )}
           </div>
           <div
@@ -3475,12 +4412,24 @@ export default function App() {
             >
               Álbuns
             </button>
+            <button
+              type="button"
+              data-v="playlists"
+              className={libraryView === 'playlists' ? 'on' : ''}
+              onClick={() => {
+                setPageStack([]);
+                setLibraryView('playlists');
+                setArtFilter(null);
+              }}
+            >
+              Playlists
+            </button>
           </nav>
 
           <div id="lbox2">
             {/* Main Library List Content */}
             <ul id="list" className={isPlaying ? 'plg' : ''}>
-              {tracks.length === 0 ? (
+              {tracks.length === 0 && libraryView !== 'playlists' ? (
                 <div className="home-wrap">
                   <div className="home-empty-card">
                     <svg className="s" style={{ width: 38, height: 38, color: 'var(--accent)' }} viewBox="0 0 24 24">
@@ -3844,6 +4793,18 @@ export default function App() {
                             sub: alb.artist ? `Álbum · ${alb.artist}` : 'Álbum',
                             img: alb.cover || cached,
                             onClick: () => setPageStack([{ t: 'album', k: alb.key }]),
+                          });
+                        });
+
+                        playlists.slice(0, 2).forEach((pl) => {
+                          if (quickPicks.length >= 6) return;
+                          const firstCover = pl.trackKeys.map((k) => coverMap.get(k)).find(Boolean);
+                          quickPicks.push({
+                            id: `qp-pl-${pl.id}`,
+                            title: pl.name,
+                            sub: `Playlist · ${plural(pl.trackKeys.length, ' faixa', ' faixas')}`,
+                            img: firstCover,
+                            onClick: () => setPageStack([{ t: 'playlist', k: pl.id }]),
                           });
                         });
 
@@ -4528,7 +5489,7 @@ export default function App() {
                       })}
                   </div>
                 </li>
-              ) : (
+              ) : libraryView === 'albums' ? (
                 /* Albums Tab */
                 albumGroups.map((g, gIdx) => {
                   const hasOnlineCover = albumCoverCache[g.key] && albumCoverCache[g.key] !== 'none';
@@ -4599,6 +5560,48 @@ export default function App() {
                     </li>
                   );
                 })
+              ) : (
+                /* Playlists Tab */
+                <li className="ahost" style={{ listStyle: 'none', padding: 0 }}>
+                  <PlaylistsView
+                    playlists={playlists}
+                    tracks={tracks}
+                    favoriteKeys={favoriteKeys}
+                    coverMap={coverMap}
+                    onOpenPlaylist={(playlistId) => setPageStack([{ t: 'playlist', k: playlistId }])}
+                    onCreatePlaylist={() => {
+                      setEditingPlaylist(null);
+                      setCreatePlaylistModalOpen(true);
+                    }}
+                    onCreateFromFavorites={createPlaylistFromFavorites}
+                    onPlayPlaylist={(pl, shuffle) => {
+                      const plIndices = pl.trackKeys
+                        .map((k) => trackIndexByKey.get(k))
+                        .filter((idx): idx is number => idx !== undefined);
+                      if (plIndices.length > 0) {
+                        playIds(plIndices, Boolean(shuffle), `Playlist: ${pl.name}`);
+                      } else {
+                        showToast('Esta playlist está vazia');
+                      }
+                    }}
+                    onOpenPlaylistMenu={(pl) => {
+                      const plIndices = pl.trackKeys
+                        .map((k) => trackIndexByKey.get(k))
+                        .filter((idx): idx is number => idx !== undefined);
+                      const covers = pl.trackKeys
+                        .map((k) => coverMap.get(k))
+                        .filter((c): c is string => Boolean(c));
+                      setActionMenu({
+                        kind: 'playlist',
+                        title: pl.name,
+                        subtitle: `${plural(pl.trackKeys.length, ' faixa', ' faixas')} • ${calculatePlaylistDuration(plIndices.map((i) => tracks[i]?.dur))}`,
+                        cover: covers[0] || null,
+                        trackIndices: plIndices,
+                        playlistId: pl.id,
+                      });
+                    }}
+                  />
+                </li>
               )}
             </ul>
 
@@ -4639,9 +5642,32 @@ export default function App() {
                           <button
                             type="button"
                             className="ib"
-                            title={activePage.t === 'artist' ? 'Opções do artista' : 'Opções do álbum'}
-                            aria-label={activePage.t === 'artist' ? 'Opções do artista' : 'Opções do álbum'}
+                            title={
+                              activePage.t === 'artist'
+                                ? 'Opções do artista'
+                                : activePage.t === 'playlist'
+                                ? 'Opções da playlist'
+                                : 'Opções do álbum'
+                            }
+                            aria-label={
+                              activePage.t === 'artist'
+                                ? 'Opções do artista'
+                                : activePage.t === 'playlist'
+                                ? 'Opções da playlist'
+                                : 'Opções do álbum'
+                            }
                             onClick={() => {
+                              if (activePage.t === 'playlist') {
+                                setActionMenu({
+                                  kind: 'playlist',
+                                  title: activePlaylist?.name || 'Playlist',
+                                  subtitle: `${plural(pageTrackIndices.length, ' faixa', ' faixas')} • ${calculatePlaylistDuration(pageTrackIndices.map((i) => tracks[i]?.dur))}`,
+                                  cover: activePlaylist ? coverMap.get(activePlaylist.trackKeys[0]) : null,
+                                  trackIndices: pageTrackIndices,
+                                  playlistId: activePlaylist?.id,
+                                });
+                                return;
+                              }
                               const isArt = activePage.t === 'artist';
                               const title = isArt ? activePage.k : activePage.k.split('||')[0];
                               setActionMenu({
@@ -4667,7 +5693,12 @@ export default function App() {
                       {activePage && (
                         <>
                           <div id="phero">
-                            {onlineHeroImg ? (
+                            {activePage.t === 'playlist' ? (
+                              <PlaylistCollage
+                                covers={activePlaylist ? activePlaylist.trackKeys.map((k) => coverMap.get(k)).filter((c): c is string => Boolean(c)) : []}
+                                large={true}
+                              />
+                            ) : onlineHeroImg ? (
                               <img
                                 src={onlineHeroImg}
                                 className={`pimg ${activePage.t === 'artist' ? 'round' : ''}`}
@@ -4682,165 +5713,208 @@ export default function App() {
                                 </svg>
                               </div>
                             )}
-                      <h2 className="pname">
-                        {activePage.t === 'artist' ? activePage.k : activePage.k.split('||')[0]}
-                      </h2>
-                      <div className="psub">
-                        {activePage.t === 'artist' ? (
-                          <>
-                            {plural(
-                              new Set(pageTrackIndices.map((n) => albKey(tracks[n]))).size,
-                              ' álbum',
-                              ' álbuns'
-                            )}
-                            {', '}
-                            {plural(pageTrackIndices.length, ' música', ' músicas')}
-                          </>
-                        ) : (
-                          <>
-                            <button
-                              className="plink"
-                              onClick={() => {
-                                const ar = activePage.k.split('||')[1] || ART_UNK;
-                                setPageStack((prev) => [...prev, { t: 'artist', k: ar }]);
-                              }}
-                            >
-                              {activePage.k.split('||')[1] || ART_UNK}
-                            </button>
-                            {' – '}
-                            {plural(pageTrackIndices.length, ' música', ' músicas')}
-                          </>
-                        )}
-                      </div>
-                    </div>
-
-                    <div id="pact">
-                      <button
-                        className="ib"
-                        title="Aleatório"
-                        aria-label="Tocar em ordem aleatória"
-                        onClick={() => playIds(pageTrackIndices, true)}
-                      >
-                        <svg className="s" viewBox="0 0 24 24">
-                          <path d="M16 3h5v5M4 20 21 3M21 16v5h-5M15 15l6 6M4 4l5 5" />
-                        </svg>
-                      </button>
-                      <button
-                        type="button"
-                        className="ib"
-                        title="Tocar tudo a seguir"
-                        aria-label="Tocar tudo a seguir"
-                        onClick={(e) => playNextAll(pageTrackIndices, e)}
-                      >
-                        <svg className="s" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                          <path d="m5 4 10 8-10 8V4zM19 5v14" />
-                        </svg>
-                      </button>
-                      <button
-                        className="ib"
-                        title="Adicionar tudo à fila"
-                        aria-label="Adicionar tudo à fila"
-                        onClick={(e) => addAllToQueue(pageTrackIndices, e)}
-                      >
-                        <svg className="s" viewBox="0 0 24 24">
-                          <path d="M3 6h12M3 12h12M3 18h8M18 14v6M15 17h6" />
-                        </svg>
-                      </button>
-                      <span className="sp"></span>
-                      <button
-                        className="ib big"
-                        aria-label="Tocar"
-                        onClick={() => playIds(pageTrackIndices, false)}
-                      >
-                        <svg viewBox="0 0 24 24" fill="currentColor">
-                          <path d="M8 5.6v12.8a1 1 0 0 0 1.5.9l10.4-6.4a1 1 0 0 0 0-1.7L9.5 4.7A1 1 0 0 0 8 5.6z" />
-                        </svg>
-                      </button>
-                    </div>
-
-                    <div id="pbody">
-                      {/* Online Info Section */}
-                      <div className="pinfo">
-                        {activePageInfoLoading ? (
-                          <div className="psrc">Buscando informações…</div>
-                        ) : activePageInfo && !activePageInfo.none && !activePageInfo.fail ? (
-                          <>
-                            <h3 className="pst">
-                              {activePage.t === 'artist' ? 'Sobre o artista' : 'Sobre o álbum'}
-                            </h3>
-                            <div className="pmeta">
+                            <h2 className="pname">
+                              {activePage.t === 'artist'
+                                ? activePage.k
+                                : activePage.t === 'playlist'
+                                ? activePlaylist?.name
+                                : activePage.k.split('||')[0]}
+                            </h2>
+                            <div className="psub">
                               {activePage.t === 'artist' ? (
                                 <>
-                                  {activePageInfo.genre && <span className="pchip">{activePageInfo.genre}</span>}
-                                  {activePageInfo.country && <span className="pchip">{activePageInfo.country}</span>}
-                                  {activePageInfo.year && (
-                                    <span className="pchip">Desde {activePageInfo.year}</span>
+                                  {plural(
+                                    new Set(pageTrackIndices.map((n) => albKey(tracks[n]))).size,
+                                    ' álbum',
+                                    ' álbuns'
+                                  )}
+                                  {', '}
+                                  {plural(pageTrackIndices.length, ' música', ' músicas')}
+                                </>
+                              ) : activePage.t === 'playlist' ? (
+                                <>
+                                  <span>
+                                    {plural(pageTrackIndices.length, ' faixa', ' faixas')} •{' '}
+                                    {calculatePlaylistDuration(pageTrackIndices.map((i) => tracks[i]?.dur))}
+                                  </span>
+                                  {activePlaylist?.description && (
+                                    <div style={{ marginTop: 4, opacity: 0.85, fontSize: '0.84rem' }}>
+                                      {activePlaylist.description}
+                                    </div>
                                   )}
                                 </>
                               ) : (
                                 <>
-                                  {activePageInfo.year && <span className="pchip">{activePageInfo.year}</span>}
-                                  {activePageInfo.genre && <span className="pchip">{activePageInfo.genre}</span>}
-                                  {activePageInfo.label && <span className="pchip">{activePageInfo.label}</span>}
-                                  {activePageInfo.tracks && (
-                                    <span className="pchip">{plural(+activePageInfo.tracks, ' faixa', ' faixas')}</span>
+                                  <button
+                                    className="plink"
+                                    onClick={() => {
+                                      const ar = activePage.k.split('||')[1] || ART_UNK;
+                                      setPageStack((prev) => [...prev, { t: 'artist', k: ar }]);
+                                    }}
+                                  >
+                                    {activePage.k.split('||')[1] || ART_UNK}
+                                  </button>
+                                  {' – '}
+                                  {plural(pageTrackIndices.length, ' música', ' músicas')}
+                                </>
+                              )}
+                            </div>
+                          </div>
+
+                          <div id="pact">
+                            <button
+                              className="ib"
+                              title="Aleatório"
+                              aria-label="Tocar em ordem aleatória"
+                              onClick={() =>
+                                playIds(
+                                  pageTrackIndices,
+                                  true,
+                                  activePage.t === 'playlist' ? `Playlist: ${activePlaylist?.name}` : undefined
+                                )
+                              }
+                            >
+                              <svg className="s" viewBox="0 0 24 24">
+                                <path d="M16 3h5v5M4 20 21 3M21 16v5h-5M15 15l6 6M4 4l5 5" />
+                              </svg>
+                            </button>
+                            <button
+                              type="button"
+                              className="ib"
+                              title="Tocar tudo a seguir"
+                              aria-label="Tocar tudo a seguir"
+                              onClick={(e) => playNextAll(pageTrackIndices, e)}
+                            >
+                              <svg className="s" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                <path d="m5 4 10 8-10 8V4zM19 5v14" />
+                              </svg>
+                            </button>
+                            <button
+                              className="ib"
+                              title="Adicionar tudo à fila"
+                              aria-label="Adicionar tudo à fila"
+                              onClick={(e) => addAllToQueue(pageTrackIndices, e)}
+                            >
+                              <svg className="s" viewBox="0 0 24 24">
+                                <path d="M3 6h12M3 12h12M3 18h8M18 14v6M15 17h6" />
+                              </svg>
+                            </button>
+                            {activePage.t === 'playlist' && (
+                              <button
+                                type="button"
+                                className="ib"
+                                title="Adicionar músicas"
+                                aria-label="Adicionar músicas à playlist"
+                                onClick={() => setAddTracksToPlaylistModalOpen(true)}
+                              >
+                                <svg className="s" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                  <path d="M12 5v14M5 12h14" />
+                                </svg>
+                              </button>
+                            )}
+                            <span className="sp"></span>
+                            <button
+                              className="ib big"
+                              aria-label="Tocar"
+                              onClick={() =>
+                                playIds(
+                                  pageTrackIndices,
+                                  false,
+                                  activePage.t === 'playlist' ? `Playlist: ${activePlaylist?.name}` : undefined
+                                )
+                              }
+                            >
+                              <svg viewBox="0 0 24 24" fill="currentColor">
+                                <path d="M8 5.6v12.8a1 1 0 0 0 1.5.9l10.4-6.4a1 1 0 0 0 0-1.7L9.5 4.7A1 1 0 0 0 8 5.6z" />
+                              </svg>
+                            </button>
+                          </div>
+
+                    <div id="pbody">
+                      {/* Online Info Section */}
+                      {activePage.t !== 'playlist' && (
+                        <div className="pinfo">
+                          {activePageInfoLoading ? (
+                            <div className="psrc">Buscando informações…</div>
+                          ) : activePageInfo && !activePageInfo.none && !activePageInfo.fail ? (
+                            <>
+                              <h3 className="pst">
+                                {activePage.t === 'artist' ? 'Sobre o artista' : 'Sobre o álbum'}
+                              </h3>
+                              <div className="pmeta">
+                                {activePage.t === 'artist' ? (
+                                  <>
+                                    {activePageInfo.genre && <span className="pchip">{activePageInfo.genre}</span>}
+                                    {activePageInfo.country && <span className="pchip">{activePageInfo.country}</span>}
+                                    {activePageInfo.year && (
+                                      <span className="pchip">Desde {activePageInfo.year}</span>
+                                    )}
+                                  </>
+                                ) : (
+                                  <>
+                                    {activePageInfo.year && <span className="pchip">{activePageInfo.year}</span>}
+                                    {activePageInfo.genre && <span className="pchip">{activePageInfo.genre}</span>}
+                                    {activePageInfo.label && <span className="pchip">{activePageInfo.label}</span>}
+                                    {activePageInfo.tracks && (
+                                      <span className="pchip">{plural(+activePageInfo.tracks, ' faixa', ' faixas')}</span>
+                                    )}
+                                  </>
+                                )}
+                              </div>
+                              {activePageInfo.bio && (
+                                <>
+                                  <p className={`pbio ${bioClamped ? 'clamp' : ''}`}>{activePageInfo.bio}</p>
+                                  {activePageInfo.bio.length > 380 && (
+                                    <button className="plnk" onClick={() => setBioClamped(!bioClamped)}>
+                                      {bioClamped ? 'Ler mais' : 'Ler menos'}
+                                    </button>
                                   )}
                                 </>
                               )}
-                            </div>
-                            {activePageInfo.bio && (
-                              <>
-                                <p className={`pbio ${bioClamped ? 'clamp' : ''}`}>{activePageInfo.bio}</p>
-                                {activePageInfo.bio.length > 380 && (
-                                  <button className="plnk" onClick={() => setBioClamped(!bioClamped)}>
-                                    {bioClamped ? 'Ler mais' : 'Ler menos'}
-                                  </button>
+                              <div className="psrc">
+                                {activePageInfo.srcs && activePageInfo.srcs.length > 0 && (
+                                  <>
+                                    Fonte:{' '}
+                                    {activePageInfo.srcs.map((srcName, sIdx) => (
+                                      <React.Fragment key={srcName}>
+                                        {sIdx > 0 && ', '}
+                                        {activePageInfo?.url && /wikip/i.test(srcName) ? (
+                                          <a href={activePageInfo.url} target="_blank" rel="noopener noreferrer">
+                                            {srcName}
+                                          </a>
+                                        ) : (
+                                          srcName
+                                        )}
+                                      </React.Fragment>
+                                    ))}
+                                  </>
                                 )}
-                              </>
-                            )}
-                            <div className="psrc">
-                              {activePageInfo.srcs && activePageInfo.srcs.length > 0 && (
-                                <>
-                                  Fonte:{' '}
-                                  {activePageInfo.srcs.map((srcName, sIdx) => (
-                                    <React.Fragment key={srcName}>
-                                      {sIdx > 0 && ', '}
-                                      {activePageInfo?.url && /wikip/i.test(srcName) ? (
-                                        <a href={activePageInfo.url} target="_blank" rel="noopener noreferrer">
-                                          {srcName}
-                                        </a>
-                                      ) : (
-                                        srcName
-                                      )}
-                                    </React.Fragment>
-                                  ))}
-                                </>
-                              )}
-                              <button
-                                onClick={() => {
-                                  const isA = activePage.t === 'artist';
-                                  iDrop(
-                                    isA ? 'artist' : 'album',
-                                    isA ? activePage.k : activePage.k.split('||')[1],
-                                    isA ? undefined : activePage.k.split('||')[0]
-                                  );
-                                  setActivePageInfoLoading(true);
-                                  iLoad(
-                                    isA ? 'artist' : 'album',
-                                    isA ? activePage.k : activePage.k.split('||')[1],
-                                    isA ? undefined : activePage.k.split('||')[0]
-                                  ).then((info) => {
-                                    setActivePageInfo(info);
-                                    setActivePageInfoLoading(false);
-                                  });
-                                }}
-                              >
-                                Atualizar
-                              </button>
-                            </div>
-                          </>
-                        ) : null}
-                      </div>
+                                <button
+                                  onClick={() => {
+                                    const isA = activePage.t === 'artist';
+                                    iDrop(
+                                      isA ? 'artist' : 'album',
+                                      isA ? activePage.k : activePage.k.split('||')[1],
+                                      isA ? undefined : activePage.k.split('||')[0]
+                                    );
+                                    setActivePageInfoLoading(true);
+                                    iLoad(
+                                      isA ? 'artist' : 'album',
+                                      isA ? activePage.k : activePage.k.split('||')[1],
+                                      isA ? undefined : activePage.k.split('||')[0]
+                                    ).then((info) => {
+                                      setActivePageInfo(info);
+                                      setActivePageInfoLoading(false);
+                                    });
+                                  }}
+                                >
+                                  Atualizar
+                                </button>
+                              </div>
+                            </>
+                          ) : null}
+                        </div>
+                      )}
 
                       {/* If Artist Page: Show their albums first */}
                       {activePage.t === 'artist' && (
@@ -4905,8 +5979,29 @@ export default function App() {
                         </>
                       )}
 
-                      {/* Track list for page */}
-                      <ul className="ptl">
+                      {/* Track list for page or empty state */}
+                      {activePage.t === 'playlist' && pageTrackIndices.length === 0 ? (
+                        <div className="pl-empty-hero" style={{ margin: '24px 0' }}>
+                          <svg className="pl-hero-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            <path d="M9 18V5l12-2v13" />
+                            <circle cx="6" cy="18" r="3" />
+                            <circle cx="18" cy="16" r="3" />
+                          </svg>
+                          <b>Esta playlist está vazia</b>
+                          <p>Adicione músicas da sua biblioteca para montar sua lista personalizada.</p>
+                          <button
+                            type="button"
+                            className="act-btn primary"
+                            onClick={() => setAddTracksToPlaylistModalOpen(true)}
+                          >
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                              <path d="M12 5v14M5 12h14" />
+                            </svg>
+                            <span>Adicionar músicas</span>
+                          </button>
+                        </div>
+                      ) : (
+                        <ul className="ptl">
                         {pageTrackIndices.map((n, j) => {
                           const t = tracks[n];
                           const isCur = n === currentIndex;
@@ -4940,9 +6035,61 @@ export default function App() {
                               )}
                               <span className="tx">
                                 <b>{t.name}</b>
-                                <small>{isAlbum ? t.artist || '' : t.album || ''}</small>
+                                <small>
+                                  {isAlbum
+                                    ? `${t.artist || ''}${t.dur ? `${t.artist ? ' • ' : ''}${t.dur}` : ''}`
+                                    : activePage.t === 'playlist'
+                                    ? `${t.artist || t.album || ''}${t.dur ? `${t.artist || t.album ? ' • ' : ''}${t.dur}` : ''}`
+                                    : `${t.album || ''}${t.dur ? `${t.album ? ' • ' : ''}${t.dur}` : ''}`}
+                                </small>
                               </span>
                               <div className="row-actions">
+                                {activePage.t === 'playlist' && (
+                                  <div className="pl-track-reorder-group" onClick={(e) => e.stopPropagation()}>
+                                    <button
+                                      type="button"
+                                      className="pl-track-reorder-btn"
+                                      disabled={j === 0}
+                                      title="Mover para cima"
+                                      aria-label={`Mover ${t.name} para cima`}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setPlaylists((prev) =>
+                                          prev.map((p) =>
+                                            p.id === activePlaylist!.id
+                                              ? reorderPlaylistTracks(p, j, j - 1)
+                                              : p
+                                          )
+                                        );
+                                      }}
+                                    >
+                                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                                        <path d="m18 15-6-6-6 6" />
+                                      </svg>
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="pl-track-reorder-btn"
+                                      disabled={j === pageTrackIndices.length - 1}
+                                      title="Mover para baixo"
+                                      aria-label={`Mover ${t.name} para baixo`}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setPlaylists((prev) =>
+                                          prev.map((p) =>
+                                            p.id === activePlaylist!.id
+                                              ? reorderPlaylistTracks(p, j, j + 1)
+                                              : p
+                                          )
+                                        );
+                                      }}
+                                    >
+                                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                                        <path d="m6 9 6 6 6-6" />
+                                      </svg>
+                                    </button>
+                                  </div>
+                                )}
                                 <button
                                   type="button"
                                   className="qb"
@@ -4965,6 +6112,29 @@ export default function App() {
                                     <path d="M12 5v14M5 12h14" />
                                   </svg>
                                 </button>
+                                {activePage.t === 'playlist' && (
+                                  <button
+                                    type="button"
+                                    className="qb"
+                                    title="Remover da playlist"
+                                    aria-label={`Remover ${t.name} da playlist`}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setPlaylists((prev) =>
+                                        prev.map((p) =>
+                                          p.id === activePlaylist!.id
+                                            ? removeTrackFromPlaylist(p, j)
+                                            : p
+                                        )
+                                      );
+                                      showToast('Faixa removida da playlist');
+                                    }}
+                                  >
+                                    <svg className="s" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                      <path d="M18 6 6 18M6 6l12 12" />
+                                    </svg>
+                                  </button>
+                                )}
                                 <button
                                   type="button"
                                   className="qb"
@@ -4994,6 +6164,7 @@ export default function App() {
                           );
                         })}
                       </ul>
+                    )}
                     </div>
                   </>
                 )}
@@ -5383,7 +6554,13 @@ export default function App() {
             <div className="ctx-sheet">
               <span className="grip" />
               <div className="ctx-head">
-                {actionMenu.cover ? (
+                {actionMenu.kind === 'playlist' ? (
+                  <PlaylistCollage
+                    covers={actionMenu.trackIndices
+                      .map((i) => coverMap.get(tracks[i]?.key))
+                      .filter((c): c is string => Boolean(c))}
+                  />
+                ) : actionMenu.cover ? (
                   <img
                     src={actionMenu.cover}
                     className={`ctx-thumb ${actionMenu.kind === 'artist' ? 'round' : ''}`}
@@ -5414,7 +6591,9 @@ export default function App() {
                         ? `Artista: ${actionMenu.title}`
                         : actionMenu.kind === 'album'
                           ? `Álbum: ${actionMenu.title}`
-                          : 'Biblioteca';
+                          : actionMenu.kind === 'playlist'
+                            ? `Playlist: ${actionMenu.title}`
+                            : 'Biblioteca';
                     playIds(actionMenu.trackIndices, false, label);
                     setActionMenu(null);
                   }}
@@ -5461,6 +6640,31 @@ export default function App() {
                   <span>Adicionar à fila</span>
                 </button>
 
+                {actionMenu.kind !== 'playlist' && (
+                  <button
+                    type="button"
+                    className="ctx-item"
+                    onClick={() => {
+                      const keys = actionMenu.trackIndices
+                        .map((idx) => tracks[idx]?.key)
+                        .filter(Boolean);
+                      setPendingTrackKeysForPlaylist(keys);
+                      setPendingLabelForPlaylist(
+                        actionMenu.kind === 'track'
+                          ? `Música: ${actionMenu.title}`
+                          : `${plural(keys.length, ' faixa', ' faixas')} de ${actionMenu.title}`
+                      );
+                      setActionMenu(null);
+                      setAddToPlaylistModalOpen(true);
+                    }}
+                  >
+                    <svg className="s" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M12 5v14M5 12h14" />
+                    </svg>
+                    <span>Adicionar à playlist…</span>
+                  </button>
+                )}
+
                 {actionMenu.kind !== 'artist' && actionMenu.artistKey && actionMenu.artistKey !== ART_UNK && (
                   <button
                     type="button"
@@ -5499,30 +6703,278 @@ export default function App() {
                   </button>
                 )}
 
-                <button
-                  type="button"
-                  className="ctx-item danger"
-                  onClick={() => {
-                    const target = {
-                      kind: actionMenu.kind,
-                      title: actionMenu.title,
-                      trackIndices: actionMenu.trackIndices,
-                    };
-                    setActionMenu(null);
-                    setConfirmRemove(target);
-                  }}
-                >
-                  <svg className="s" viewBox="0 0 24 24">
-                    <path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 11v6M14 11v6" />
-                  </svg>
-                  <span>
-                    {actionMenu.kind === 'artist'
-                      ? `Remover artista da biblioteca (${plural(actionMenu.trackIndices.length, ' música', ' músicas')})`
-                      : actionMenu.kind === 'album'
-                        ? `Remover álbum da biblioteca (${plural(actionMenu.trackIndices.length, ' música', ' músicas')})`
-                        : 'Remover música da biblioteca'}
-                  </span>
-                </button>
+                {actionMenu.kind === 'track' && (
+                  <>
+                    <button
+                      type="button"
+                      className={`ctx-item ctx-raw-trigger ${showRawFileInfo ? 'on' : ''}`}
+                      aria-expanded={showRawFileInfo}
+                      onClick={() => setShowRawFileInfo((prev) => !prev)}
+                    >
+                      <svg className="s" viewBox="0 0 24 24">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                        <path d="M14 2v6h6M9 13h6M9 17h4" />
+                      </svg>
+                      <span>Informações do arquivo</span>
+                      <svg
+                        className={`s ctx-raw-chev ${showRawFileInfo ? 'on' : ''}`}
+                        viewBox="0 0 24 24"
+                      >
+                        <path d="m6 9 6 6 6-6" />
+                      </svg>
+                    </button>
+
+                    {showRawFileInfo && (
+                      <div className="ctx-raw-panel" role="region" aria-label="Informações técnicas do arquivo">
+                        {rawFileInfoLoading && !rawFileInfo ? (
+                          <div className="ctx-raw-loading">Lendo cabeçalho binário do arquivo...</div>
+                        ) : rawFileInfo ? (
+                          <>
+                            <div className="ctx-raw-top">
+                              <div className="ctx-raw-badges">
+                                <span className="ctx-raw-badge accent">{rawFileInfo.extension}</span>
+                                <span className="ctx-raw-badge">
+                                  {rawFileInfo.sampleRateHz
+                                    ? `${(rawFileInfo.sampleRateHz / 1000).toFixed(1).replace('.0', '').replace('.', ',')} kHz`
+                                    : '44,1 kHz'}
+                                </span>
+                                {rawFileInfo.bitrateKbps && (
+                                  <span className="ctx-raw-badge">{rawFileInfo.bitrateKbps} kbps</span>
+                                )}
+                                <span className="ctx-raw-badge">
+                                  {rawFileInfo.sizeFormatted.split(' (')[0]}
+                                </span>
+                              </div>
+                              <button
+                                type="button"
+                                className="ctx-raw-copy"
+                                onClick={() => {
+                                  const summaryLines = [
+                                    `Arquivo: ${rawFileInfo.originalFileName}`,
+                                    `Tamanho: ${rawFileInfo.sizeFormatted}`,
+                                    `Formato/Codec: ${rawFileInfo.containerCodec}`,
+                                    `MIME: ${rawFileInfo.mimeType}`,
+                                    `Taxa de amostragem: ${rawFileInfo.sampleRateFormatted}`,
+                                    `Bitrate: ${rawFileInfo.bitrateFormatted}`,
+                                    `Canais: ${rawFileInfo.channelMode}`,
+                                    `Profundidade: ${rawFileInfo.bitDepth}`,
+                                    `Duração: ${rawFileInfo.durationFormatted}`,
+                                    `Tags: ${rawFileInfo.tagFormat}`,
+                                    `Capa embutida: ${rawFileInfo.embeddedCoverInfo}`,
+                                    `Chave local: ${rawFileInfo.storageKey}`,
+                                  ].join('\n');
+                                  navigator.clipboard?.writeText(summaryLines).then(
+                                    () => showToast('Dados técnicos copiados!'),
+                                    () => showToast('Não foi possível copiar')
+                                  );
+                                }}
+                              >
+                                Copiar
+                              </button>
+                            </div>
+
+                            <dl className="ctx-raw-grid">
+                              <div className="ctx-raw-row full">
+                                <dt>Nome do arquivo original</dt>
+                                <dd className="mono">{rawFileInfo.originalFileName}</dd>
+                              </div>
+                              <div className="ctx-raw-row">
+                                <dt>Tamanho bruto</dt>
+                                <dd>{rawFileInfo.sizeFormatted}</dd>
+                              </div>
+                              <div className="ctx-raw-row">
+                                <dt>Taxa de amostragem</dt>
+                                <dd>{rawFileInfo.sampleRateFormatted}</dd>
+                              </div>
+                              <div className="ctx-raw-row">
+                                <dt>Taxa de bits (Bitrate)</dt>
+                                <dd>{rawFileInfo.bitrateFormatted}</dd>
+                              </div>
+                              <div className="ctx-raw-row">
+                                <dt>Canais de áudio</dt>
+                                <dd>{rawFileInfo.channelMode}</dd>
+                              </div>
+                              <div className="ctx-raw-row">
+                                <dt>Formato / Codec</dt>
+                                <dd>{rawFileInfo.containerCodec}</dd>
+                              </div>
+                              <div className="ctx-raw-row">
+                                <dt>Tipo MIME / Bits</dt>
+                                <dd>
+                                  {rawFileInfo.mimeType} • {rawFileInfo.bitDepth}
+                                </dd>
+                              </div>
+                              <div className="ctx-raw-row">
+                                <dt>Duração exata</dt>
+                                <dd>{rawFileInfo.durationFormatted}</dd>
+                              </div>
+                              <div className="ctx-raw-row">
+                                <dt>Cabeçalho de tags</dt>
+                                <dd>{rawFileInfo.tagFormat}</dd>
+                              </div>
+                              <div className="ctx-raw-row">
+                                <dt>Capa embutida (APIC)</dt>
+                                <dd>{rawFileInfo.embeddedCoverInfo}</dd>
+                              </div>
+                              {(rawFileInfo.year || rawFileInfo.trackNumber || rawFileInfo.genre) && (
+                                <div className="ctx-raw-row">
+                                  <dt>Tags extras (Ano/Faixa/Gênero)</dt>
+                                  <dd>
+                                    {[
+                                      rawFileInfo.year ? `Ano ${rawFileInfo.year}` : '',
+                                      rawFileInfo.trackNumber ? `Faixa #${rawFileInfo.trackNumber}` : '',
+                                      rawFileInfo.genre || '',
+                                    ]
+                                      .filter(Boolean)
+                                      .join(' • ')}
+                                  </dd>
+                                </div>
+                              )}
+                              {rawFileInfo.encoder && (
+                                <div className="ctx-raw-row">
+                                  <dt>Codificador (Encoder)</dt>
+                                  <dd className="mono">{rawFileInfo.encoder}</dd>
+                                </div>
+                              )}
+                              {rawFileInfo.lastModified && (
+                                <div className="ctx-raw-row">
+                                  <dt>Modificado em</dt>
+                                  <dd>{rawFileInfo.lastModified}</dd>
+                                </div>
+                              )}
+                              <div className="ctx-raw-row full">
+                                <dt>Identificador interno (IndexedDB)</dt>
+                                <dd className="mono">
+                                  {rawFileInfo.dbId != null ? `ID #${rawFileInfo.dbId} • ` : ''}
+                                  {rawFileInfo.storageKey}
+                                </dd>
+                              </div>
+                            </dl>
+                          </>
+                        ) : (
+                          <div className="ctx-raw-loading">Não foi possível ler os dados brutos.</div>
+                        )}
+                      </div>
+                    )}
+                  </>
+                )}
+
+                {actionMenu.kind === 'playlist' ? (
+                  <>
+                    <button
+                      type="button"
+                      className="ctx-item"
+                      onClick={() => {
+                        const pl = playlists.find((p) => p.id === actionMenu.playlistId);
+                        if (pl) {
+                          setActionMenu(null);
+                          setAddTracksToPlaylistModalOpen(true);
+                        }
+                      }}
+                    >
+                      <svg className="s" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <path d="M12 5v14M5 12h14" />
+                      </svg>
+                      <span>Adicionar músicas…</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="ctx-item"
+                      onClick={() => {
+                        const pl = playlists.find((p) => p.id === actionMenu.playlistId);
+                        if (pl) {
+                          setActionMenu(null);
+                          setEditingPlaylist(pl);
+                          setCreatePlaylistModalOpen(true);
+                        }
+                      }}
+                    >
+                      <svg className="s" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+                        <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
+                      </svg>
+                      <span>Renomear / Editar</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="ctx-item"
+                      onClick={() => {
+                        const pl = playlists.find((p) => p.id === actionMenu.playlistId);
+                        if (pl) {
+                          setActionMenu(null);
+                          const dup = duplicatePlaylist(pl);
+                          setPlaylists((prev) => [dup, ...prev]);
+                          showToast('Playlist duplicada!');
+                        }
+                      }}
+                    >
+                      <svg className="s" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                      </svg>
+                      <span>Duplicar playlist</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="ctx-item"
+                      onClick={() => {
+                        const pl = playlists.find((p) => p.id === actionMenu.playlistId);
+                        if (pl) {
+                          setActionMenu(null);
+                          exportPlaylistM3u(pl);
+                        }
+                      }}
+                    >
+                      <svg className="s" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                        <polyline points="7 10 12 15 17 10" />
+                        <line x1="12" y1="15" x2="12" y2="3" />
+                      </svg>
+                      <span>Exportar playlist (.m3u)</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="ctx-item danger"
+                      onClick={() => {
+                        const pl = playlists.find((p) => p.id === actionMenu.playlistId);
+                        if (pl) {
+                          setActionMenu(null);
+                          setConfirmDeletePlaylist(pl);
+                        }
+                      }}
+                    >
+                      <svg className="s" viewBox="0 0 24 24">
+                        <path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 11v6M14 11v6" />
+                      </svg>
+                      <span>Excluir playlist</span>
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    className="ctx-item danger"
+                    onClick={() => {
+                      const target = {
+                        kind: actionMenu.kind,
+                        title: actionMenu.title,
+                        trackIndices: actionMenu.trackIndices,
+                      };
+                      setActionMenu(null);
+                      setConfirmRemove(target);
+                    }}
+                  >
+                    <svg className="s" viewBox="0 0 24 24">
+                      <path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 11v6M14 11v6" />
+                    </svg>
+                    <span>
+                      {actionMenu.kind === 'artist'
+                        ? `Remover artista da biblioteca (${plural(actionMenu.trackIndices.length, ' música', ' músicas')})`
+                        : actionMenu.kind === 'album'
+                          ? `Remover álbum da biblioteca (${plural(actionMenu.trackIndices.length, ' música', ' músicas')})`
+                          : 'Remover música da biblioteca'}
+                    </span>
+                  </button>
+                )}
               </div>
             </div>
           </div>
@@ -5734,6 +7186,49 @@ export default function App() {
                   ))}
                 </div>
 
+                <div className="s-row" style={{ marginTop: 6 }}>
+                  <div className="s-row-info">
+                    <b>Esquema de cores</b>
+                    <small>Selecione a cor de destaque do player e interface</small>
+                  </div>
+                </div>
+                <div className="s-color-grid">
+                  {COLOR_SCHEMES.map((scheme) => {
+                    const isSelected = colorScheme === scheme.id;
+                    return (
+                      <button
+                        key={scheme.id}
+                        type="button"
+                        className={`s-color-card ${isSelected ? 'on' : ''}`}
+                        onClick={() => setColorScheme(scheme.id)}
+                        aria-pressed={isSelected}
+                      >
+                        <span
+                          className="s-color-swatch"
+                          style={{
+                            backgroundColor: scheme.color,
+                            boxShadow: isSelected
+                              ? `0 0 0 2px var(--surface), 0 0 10px ${scheme.color}88`
+                              : '0 2px 5px rgba(0,0,0,0.2)',
+                          }}
+                        />
+                        <span className="s-color-name">{scheme.label}</span>
+                        <svg
+                          className="s-color-check"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="3"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        >
+                          <polyline points="20 6 9 17 4 12" />
+                        </svg>
+                      </button>
+                    );
+                  })}
+                </div>
+
                 <button
                   type="button"
                   className="s-btn"
@@ -5750,6 +7245,55 @@ export default function App() {
                   <div className="s-btn-tx">
                     <b>Rever tour de boas-vindas</b>
                     <small>Mostra o passo a passo das funcionalidades do Vitrola</small>
+                  </div>
+                </button>
+              </div>
+            </div>
+
+            {/* Backup e Restauração (JSON) */}
+            <div className="s-group">
+              <h3 className="s-group-title">Backup e restauração</h3>
+              <div className="s-card">
+                <input
+                  ref={backupInputRef}
+                  type="file"
+                  accept=".json,application/json"
+                  style={{ display: 'none' }}
+                  onChange={handleImportBackupFile}
+                />
+                <button
+                  type="button"
+                  className="s-btn"
+                  onClick={handleExportBackup}
+                >
+                  <svg className="s" viewBox="0 0 24 24">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                    <path d="m7 10 5 5 5-5" />
+                    <path d="M12 15V3" />
+                  </svg>
+                  <div className="s-btn-tx">
+                    <b>Exportar backup da biblioteca e player (JSON)</b>
+                    <small>
+                      Salva metadados das músicas (nome, artista, álbum), configurações e estado atual do player
+                    </small>
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  className="s-btn"
+                  onClick={() => backupInputRef.current?.click()}
+                >
+                  <svg className="s" viewBox="0 0 24 24">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                    <path d="m17 8-5-5-5 5" />
+                    <path d="M12 3v12" />
+                  </svg>
+                  <div className="s-btn-tx">
+                    <b>Restaurar backup (JSON)</b>
+                    <small>
+                      Importa configurações, metadados da biblioteca e retorna o player ao estado exato do backup
+                    </small>
                   </div>
                 </button>
               </div>
@@ -5882,9 +7426,10 @@ export default function App() {
                   onClick={() => {
                     if (confirmRemove.kind === 'all_tracks') {
                       executeClearAllTracks();
-                    } else {
+                    } else if (confirmRemove.kind !== 'playlist') {
                       executeDeleteTracks(confirmRemove.trackIndices, confirmRemove.kind, confirmRemove.title);
                     }
+                    setConfirmRemove(null);
                   }}
                 >
                   Sim, remover
@@ -6017,6 +7562,98 @@ export default function App() {
           </div>
         )}
 
+        {/* Playlist Modals */}
+        <CreatePlaylistModal
+          isOpen={createPlaylistModalOpen}
+          onClose={() => {
+            setCreatePlaylistModalOpen(false);
+            setEditingPlaylist(null);
+          }}
+          initialName={editingPlaylist ? editingPlaylist.name : ''}
+          initialDescription={editingPlaylist ? editingPlaylist.description || '' : ''}
+          isEditing={Boolean(editingPlaylist)}
+          onSave={(name, description) => {
+            if (editingPlaylist) {
+              setPlaylists((prev) =>
+                prev.map((p) =>
+                  p.id === editingPlaylist.id ? renamePlaylist(p, name, description) : p
+                )
+              );
+              showToast('Playlist atualizada!');
+            } else {
+              const newPl = createPlaylist(name, description, pendingTrackKeysForPlaylist);
+              setPlaylists((prev) => [newPl, ...prev]);
+              if (pendingTrackKeysForPlaylist.length > 0) {
+                showToast(`Playlist criada com ${plural(pendingTrackKeysForPlaylist.length, ' música', ' músicas')}!`);
+                setPendingTrackKeysForPlaylist([]);
+              } else {
+                showToast('Playlist criada com sucesso!');
+              }
+              setLibraryView('playlists');
+              setPageStack([{ t: 'playlist', k: newPl.id }]);
+            }
+          }}
+        />
+
+        <AddToPlaylistModal
+          isOpen={addToPlaylistModalOpen}
+          onClose={() => {
+            setAddToPlaylistModalOpen(false);
+            setPendingTrackKeysForPlaylist([]);
+            setPendingLabelForPlaylist('');
+          }}
+          trackKeysToAdd={pendingTrackKeysForPlaylist}
+          trackCountLabel={pendingLabelForPlaylist}
+          playlists={playlists}
+          coverMap={coverMap}
+          onSelectPlaylist={(playlistId) => {
+            const targetPl = playlists.find((p) => p.id === playlistId);
+            if (targetPl && pendingTrackKeysForPlaylist.length > 0) {
+              setPlaylists((prev) =>
+                prev.map((p) =>
+                  p.id === playlistId ? addTracksToPlaylist(p, pendingTrackKeysForPlaylist) : p
+                )
+              );
+              showToast(`Adicionado a "${targetPl.name}"!`);
+            }
+          }}
+          onCreateNewPlaylist={() => {
+            setEditingPlaylist(null);
+            setCreatePlaylistModalOpen(true);
+          }}
+        />
+
+        <AddTracksToPlaylistModal
+          isOpen={addTracksToPlaylistModalOpen}
+          onClose={() => setAddTracksToPlaylistModalOpen(false)}
+          playlist={activePlaylist}
+          tracks={tracks}
+          onAddTracks={(keysToAdd) => {
+            if (activePlaylist && keysToAdd.length > 0) {
+              setPlaylists((prev) =>
+                prev.map((p) =>
+                  p.id === activePlaylist.id ? addTracksToPlaylist(p, keysToAdd) : p
+                )
+              );
+              showToast(`${plural(keysToAdd.length, ' faixa adicionada', ' faixas adicionadas')}!`);
+            }
+          }}
+        />
+
+        <ConfirmDeletePlaylistModal
+          isOpen={Boolean(confirmDeletePlaylist)}
+          onClose={() => setConfirmDeletePlaylist(null)}
+          playlist={confirmDeletePlaylist}
+          onConfirm={() => {
+            if (confirmDeletePlaylist) {
+              const targetId = confirmDeletePlaylist.id;
+              setPlaylists((prev) => prev.filter((p) => p.id !== targetId));
+              setPageStack((prev) => prev.filter((p) => !(p.t === 'playlist' && p.k === targetId)));
+              showToast('Playlist excluída');
+            }
+          }}
+        />
+
         {/* HTML5 Audio Element */}
         <audio
           ref={audioRef}
@@ -6031,7 +7668,22 @@ export default function App() {
           }}
           onLoadedMetadata={() => {
             if (audioRef.current) {
-              setDuration(audioRef.current.duration);
+              const d = audioRef.current.duration;
+              setDuration(d);
+              if (
+                Number.isFinite(d) &&
+                d > 0 &&
+                currentIndex >= 0 &&
+                tracks[currentIndex] &&
+                !tracks[currentIndex].dur
+              ) {
+                const durStr = formatTime(Math.round(d));
+                const curKey = tracks[currentIndex].key;
+                setTracks((prev) =>
+                  prev.map((tr, idx) => (idx === currentIndex ? { ...tr, dur: durStr } : tr))
+                );
+                dbUpdateDurations(new Map([[curKey, durStr]]));
+              }
             }
           }}
           onEnded={() => {

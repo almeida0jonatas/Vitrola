@@ -448,12 +448,63 @@ app.get('/api/translate-lyrics', async (req: Request, res: Response) => {
   }
 });
 
+// Web App Manifest route that dynamically outputs theme_color and background_color matching dark or light theme
+app.get(['/manifest.webmanifest', '/manifest.json'], (req: Request, res: Response) => {
+  const isLight = req.query.theme === 'light';
+  const color = isLight ? '#f4f5f8' : '#14171f';
+  res.setHeader('Content-Type', 'application/manifest+json');
+  return res.json({
+    id: '/',
+    name: 'Vitrola',
+    short_name: 'Vitrola',
+    description:
+      'Player de música local com suporte a tags ID3, letras sincronizadas, capas, artistas, álbuns e persistência local via IndexedDB.',
+    theme_color: color,
+    background_color: color,
+    display: 'standalone',
+    orientation: 'portrait',
+    categories: ['music', 'entertainment'],
+    start_url: '/',
+    scope: '/',
+    icons: [
+      {
+        src: '/pwa-192x192.png',
+        sizes: '192x192',
+        type: 'image/png',
+        purpose: 'any',
+      },
+      {
+        src: '/pwa-512x512.png',
+        sizes: '512x512',
+        type: 'image/png',
+        purpose: 'any',
+      },
+      {
+        src: '/pwa-maskable-512x512.png',
+        sizes: '512x512',
+        type: 'image/png',
+        purpose: 'maskable',
+      },
+      {
+        src: '/pwa-monochrome-512x512.png',
+        sizes: '512x512',
+        type: 'image/png',
+        purpose: 'monochrome',
+      },
+    ],
+  });
+});
+
 async function main() {
   const isProduction = process.env.NODE_ENV === 'production';
 
   if (!isProduction) {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: false,
+        watch: process.env.DISABLE_HMR === 'true' ? null : undefined,
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
